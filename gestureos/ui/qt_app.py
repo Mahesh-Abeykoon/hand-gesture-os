@@ -6,6 +6,7 @@ from collections import deque
 from typing import Deque, Dict, Optional
 
 import cv2
+import numpy as np
 
 from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
@@ -122,8 +123,178 @@ class Sparkline(QWidget):
             prev = (x, y)
 
 
+class WhiteboardRecognizer:
+    """Lightweight template OCR for demo-ready digit/character recognition."""
+
+    def __init__(self):
+        self.templates = self._build_templates()
+
+    def _build_templates(self):
+        templates = {}
+        chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        fonts = [cv2.FONT_HERSHEY_SIMPLEX, cv2.FONT_HERSHEY_DUPLEX, cv2.FONT_HERSHEY_COMPLEX]
+        for ch in chars:
+            variants = []
+            for font in fonts:
+                for scale in (1.5, 1.8, 2.1):
+                    img = np.zeros((96, 96), dtype=np.uint8)
+                    (tw, th), _ = cv2.getTextSize(ch, font, scale, 4)
+                    x = max(1, (96 - tw) // 2)
+                    y = max(th + 2, (96 + th) // 2)
+                    cv2.putText(img, ch, (x, y), font, scale, 255, 4, cv2.LINE_AA)
+                    variants.append(self._normalize(img))
+            templates[ch] = variants
+        return templates
+
+    def _normalize(self, img: np.ndarray) -> np.ndarray:
+        if img.ndim == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        _, img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        pts = cv2.findNonZero(img)
+        if pts is None:
+            return np.zeros((64, 64), dtype=np.float32)
+        x, y, w, h = cv2.boundingRect(pts)
+        crop = img[y:y+h, x:x+w]
+        side = max(w, h) + 18
+        square = np.zeros((side, side), dtype=np.uint8)
+        ox, oy = (side - w) // 2, (side - h) // 2
+        square[oy:oy+h, ox:ox+w] = crop
+        norm = cv2.resize(square, (64, 64), interpolation=cv2.INTER_AREA)
+        return (norm > 80).astype(np.float32)
+
+    def recognize_symbol(self, ink_binary: np.ndarray) -> tuple[str, float]:
+        x = self._normalize(ink_binary)
+        best_ch, best_score = "?", 1e9
+        for ch, variants in self.templates.items():
+            score = min(float(np.mean((x - t) ** 2)) for t in variants)
+            if score < best_score:
+                best_ch, best_score = ch, score
+        confidence = max(0.0, min(1.0, 1.0 - best_score * 3.0))
+        return best_ch, confidence
+
+    def recognize_components(self, ink_binary: np.ndarray) -> str:
+        kernel = np.ones((5, 5), np.uint8)
+        merged = cv2.dilate(ink_binary, kernel, iterations=1)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats((merged > 0).astype(np.uint8), 8)
+        boxes = []
+        for i in range(1, n):
+            x, y, w, h, area = stats[i]
+            if area > 25 and w > 4 and h > 8:
+                boxes.append((x, y, w, h))
+        boxes.sort(key=lambda b: b[0])
+        if not boxes:
+            return ""
+        chars = []
+        prev_end = None
+        for x, y, w, h in boxes[:16]:
+            if prev_end is not None and x - prev_end > max(18, w * 0.8):
+                chars.append(" ")
+            pad = 8
+            crop = ink_binary[max(0, y-pad):min(ink_binary.shape[0], y+h+pad), max(0, x-pad):min(ink_binary.shape[1], x+w+pad)]
+            ch, _ = self.recognize_symbol(crop)
+            chars.append(ch)
+            prev_end = x + w
+        return "".join(chars)
+
+
+class WhiteboardCanvas(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setMinimumHeight(560)
+        self.canvas = QImage(1200, 720, QImage.Format.Format_RGB32)
+        self.canvas.fill(QColor("white"))
+        self.pen_color = QColor("#111827")
+        self.pen_width = 7
+        self.cursor_x = self.canvas.width() / 2
+        self.cursor_y = self.canvas.height() / 2
+        self.last_draw = False
+        self.mouse_down = False
+        self.recognizer = WhiteboardRecognizer()
+
+    def clear(self):
+        self.canvas.fill(QColor("white"))
+        self.update()
+
+    def set_pen_width(self, width: int):
+        self.pen_width = int(width)
+
+    def update_from_gesture(self, dx: float, dy: float, drawing: bool):
+        # Gesture deltas are normalized; amplify a little for canvas-space drawing.
+        nx = max(0, min(self.canvas.width() - 1, self.cursor_x + dx * self.canvas.width() * 1.55))
+        ny = max(0, min(self.canvas.height() - 1, self.cursor_y + dy * self.canvas.height() * 1.55))
+        if drawing:
+            painter = QPainter(self.canvas)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(QPen(self.pen_color, self.pen_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            painter.drawLine(int(self.cursor_x), int(self.cursor_y), int(nx), int(ny))
+            painter.end()
+        self.cursor_x, self.cursor_y = nx, ny
+        self.last_draw = drawing
+        self.update()
+
+    def _ink_binary(self) -> np.ndarray:
+        img = self.canvas.convertToFormat(QImage.Format.Format_RGB32)
+        ptr = img.bits()
+        ptr.setsize(img.bytesPerLine() * img.height())
+        arr = np.frombuffer(ptr, np.uint8).reshape((img.height(), img.bytesPerLine() // 4, 4))[:, :img.width(), :3]
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        return (gray < 245).astype(np.uint8) * 255
+
+    def recognize(self) -> tuple[str, str]:
+        ink = self._ink_binary()
+        if cv2.countNonZero(ink) < 40:
+            return "Nothing drawn", ""
+        ch, conf = self.recognizer.recognize_symbol(ink)
+        seq = self.recognizer.recognize_components(ink)
+        return f"Best single symbol: {ch}  ({conf:.2f})", f"Components / word guess: {seq}"
+
+    def paintEvent(self, event):  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#0e1420"))
+        target = self.rect().adjusted(10, 10, -10, -10)
+        pix = QPixmap.fromImage(self.canvas).scaled(target.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        x = target.x() + (target.width() - pix.width()) // 2
+        y = target.y() + (target.height() - pix.height()) // 2
+        painter.drawPixmap(x, y, pix)
+        sx, sy = pix.width() / self.canvas.width(), pix.height() / self.canvas.height()
+        cx, cy = x + self.cursor_x * sx, y + self.cursor_y * sy
+        painter.setPen(QPen(QColor("#2563eb"), 2))
+        painter.drawEllipse(int(cx - 8), int(cy - 8), 16, 16)
+        if self.last_draw:
+            painter.setPen(QPen(QColor("#ef4444"), 2))
+            painter.drawEllipse(int(cx - 13), int(cy - 13), 26, 26)
+
+    def mousePressEvent(self, event):  # noqa: N802
+        self.mouse_down = True
+        self._mouse_draw(event.position().x(), event.position().y(), False)
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        self._mouse_draw(event.position().x(), event.position().y(), self.mouse_down)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        self.mouse_down = False
+
+    def _mouse_draw(self, x, y, drawing):
+        # Test drawing with real mouse too.
+        target = self.rect().adjusted(10, 10, -10, -10)
+        scale = min(target.width() / self.canvas.width(), target.height() / self.canvas.height())
+        ox = target.x() + (target.width() - self.canvas.width() * scale) / 2
+        oy = target.y() + (target.height() - self.canvas.height() * scale) / 2
+        nx = max(0, min(self.canvas.width() - 1, (x - ox) / scale))
+        ny = max(0, min(self.canvas.height() - 1, (y - oy) / scale))
+        if drawing:
+            painter = QPainter(self.canvas)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(QPen(self.pen_color, self.pen_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            painter.drawLine(int(self.cursor_x), int(self.cursor_y), int(nx), int(ny))
+            painter.end()
+        self.cursor_x, self.cursor_y = nx, ny
+        self.update()
+
+
 class EngineWorker(QObject):
-    frameReady = pyqtSignal(QImage, str, float, float, bool, bool)
+    frameReady = pyqtSignal(QImage, str, float, float, bool, bool, float, float, float, float, bool)
     logReady = pyqtSignal(str)
     errorReady = pyqtSignal(str)
     startedReady = pyqtSignal()
@@ -151,7 +322,10 @@ class EngineWorker(QObject):
                 qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
                 active = self.config.gesture_mode_active or not self.config.activation_required
                 hand_seen = bool(getattr(self.engine, "last_hands", []))
-                self.frameReady.emit(qimg, event.gesture.value, float(event.confidence), float(fps), active, hand_seen)
+                cx, cy = getattr(self.engine, "last_cursor_pos", (0.5, 0.5))
+                dx, dy = getattr(self.engine, "last_cursor_delta", (0.0, 0.0))
+                draw_active = bool(getattr(self.engine, "last_draw_active", False))
+                self.frameReady.emit(qimg, event.gesture.value, float(event.confidence), float(fps), active, hand_seen, float(cx), float(cy), float(dx), float(dy), draw_active)
                 QThread.msleep(1)
         except Exception as exc:
             self.errorReady.emit(str(exc))
@@ -175,6 +349,11 @@ class EngineWorker(QObject):
     @pyqtSlot(bool)
     def set_active(self, active: bool):
         self.config.gesture_mode_active = active
+
+    @pyqtSlot(bool)
+    def set_whiteboard_mode(self, enabled: bool):
+        setattr(self.config, "whiteboard_mode", bool(enabled))
+        self.logReady.emit("Whiteboard gesture mode enabled" if enabled else "Whiteboard gesture mode disabled")
 
     @pyqtSlot(str, str)
     def record_custom(self, name: str, action: str):
@@ -276,6 +455,7 @@ class GestureOSQtApp(QMainWindow):
     applyConfigRequested = pyqtSignal()
     setActiveRequested = pyqtSignal(bool)
     recordCustomRequested = pyqtSignal(str, str)
+    whiteboardModeRequested = pyqtSignal(bool)
     pauseRequested = pyqtSignal(bool)
     stopRequested = pyqtSignal()
 
@@ -346,13 +526,16 @@ class GestureOSQtApp(QMainWindow):
         metrics.addWidget(self.hand_card, 0, 3)
         left.addLayout(metrics)
 
-        right_tabs = QTabWidget()
-        right_tabs.setMinimumWidth(410)
-        main.addWidget(right_tabs, 1)
-        right_tabs.addTab(self._controls_tab(), "Control")
-        right_tabs.addTab(self._gestures_tab(), "Gestures")
-        right_tabs.addTab(self._diagnostics_tab(), "Diagnostics")
-        right_tabs.addTab(self._trainer_tab(), "Trainer")
+        self.right_tabs = QTabWidget()
+        self.right_tabs.setMinimumWidth(410)
+        main.addWidget(self.right_tabs, 1)
+        self.right_tabs.addTab(self._controls_tab(), "Control")
+        self.right_tabs.addTab(self._gestures_tab(), "Gestures")
+        self.right_tabs.addTab(self._diagnostics_tab(), "Diagnostics")
+        self.whiteboard_tab_widget = self._whiteboard_tab()
+        self.right_tabs.addTab(self.whiteboard_tab_widget, "Whiteboard")
+        self.right_tabs.addTab(self._trainer_tab(), "Trainer")
+        self.right_tabs.currentChanged.connect(self._tab_changed)
 
     def _controls_tab(self) -> QWidget:
         tab = QWidget(); layout = QVBoxLayout(tab)
@@ -444,6 +627,40 @@ class GestureOSQtApp(QMainWindow):
         layout.addWidget(clear)
         return tab
 
+
+    def _whiteboard_tab(self) -> QWidget:
+        tab = QWidget(); layout = QVBoxLayout(tab)
+        title = QLabel("Gesture Whiteboard")
+        title.setObjectName("MetricValue")
+        subtitle = QLabel("Move with index finger. Touch thumb to index and move to draw. Release thumb to stop drawing. Recognition is lightweight template OCR for digits/letters.")
+        subtitle.setObjectName("Subtitle")
+        subtitle.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+        self.whiteboard = WhiteboardCanvas()
+        layout.addWidget(self.whiteboard, 1)
+        controls = QHBoxLayout()
+        clear_btn = QPushButton("Clear")
+        clear_btn.setObjectName("Danger")
+        clear_btn.clicked.connect(lambda: (self.whiteboard.clear(), self.whiteboard_result.setText("Draw a number/letter, then click Recognize.")))
+        recog_btn = QPushButton("Recognize Number / Character / Word")
+        recog_btn.setObjectName("Primary")
+        recog_btn.clicked.connect(self._recognize_whiteboard)
+        self.pen_slider = QSlider(Qt.Orientation.Horizontal)
+        self.pen_slider.setRange(2, 18)
+        self.pen_slider.setValue(7)
+        self.pen_slider.valueChanged.connect(self.whiteboard.set_pen_width)
+        controls.addWidget(clear_btn)
+        controls.addWidget(recog_btn)
+        controls.addWidget(QLabel("Pen"))
+        controls.addWidget(self.pen_slider)
+        layout.addLayout(controls)
+        self.whiteboard_result = QLabel("Draw a number/letter, then click Recognize.")
+        self.whiteboard_result.setObjectName("Subtitle")
+        self.whiteboard_result.setWordWrap(True)
+        layout.addWidget(self.whiteboard_result)
+        return tab
+
     def _trainer_tab(self) -> QWidget:
         tab = QWidget(); layout = QVBoxLayout(tab)
         info = QTextEdit()
@@ -485,12 +702,13 @@ class GestureOSQtApp(QMainWindow):
         self.applyConfigRequested.connect(self.worker.apply_config)
         self.setActiveRequested.connect(self.worker.set_active)
         self.recordCustomRequested.connect(self.worker.record_custom)
+        self.whiteboardModeRequested.connect(self.worker.set_whiteboard_mode)
         self.pauseRequested.connect(self.worker.set_paused)
         self.stopRequested.connect(self.worker.stop)
         self.thread.start()
 
-    @pyqtSlot(QImage, str, float, float, bool, bool)
-    def _on_frame(self, img: QImage, gesture: str, confidence: float, fps: float, active: bool, hand_seen: bool):
+    @pyqtSlot(QImage, str, float, float, bool, bool, float, float, float, float, bool)
+    def _on_frame(self, img: QImage, gesture: str, confidence: float, fps: float, active: bool, hand_seen: bool, cx: float, cy: float, dx: float, dy: float, draw_active: bool):
         pix = QPixmap.fromImage(img).scaled(self.video.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         self.video.setPixmap(pix)
         self.fps_card.set_value(f"{fps:.1f}")
@@ -502,9 +720,24 @@ class GestureOSQtApp(QMainWindow):
         self.active_btn.setText("Active" if active else "Activate")
         self.fps_graph.add(fps)
         self.conf_graph.add(confidence)
+        if hasattr(self, "whiteboard") and self.right_tabs.currentWidget() is self.whiteboard_tab_widget:
+            self.whiteboard.update_from_gesture(dx, dy, draw_active and hand_seen and active)
         if hand_seen != self.last_hand_seen:
             self._log("Hand locked" if hand_seen else "Hand lost")
             self.last_hand_seen = hand_seen
+
+
+    def _tab_changed(self, index: int):
+        enabled = hasattr(self, "whiteboard_tab_widget") and self.right_tabs.currentWidget() is self.whiteboard_tab_widget
+        self.whiteboardModeRequested.emit(bool(enabled))
+        if enabled:
+            self._log("Whiteboard mode: OS actions paused; gestures draw on canvas")
+
+    def _recognize_whiteboard(self):
+        if not hasattr(self, "whiteboard"):
+            return
+        single, sequence = self.whiteboard.recognize()
+        self.whiteboard_result.setText(single + (f"\n{sequence}" if sequence else ""))
 
     def _toggle_active(self, checked: bool):
         self.config_data.gesture_mode_active = bool(checked)

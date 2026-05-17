@@ -36,6 +36,8 @@ class GestureEngine:
         self.last_event = GestureEvent(Gesture.NONE, 0.0)
         self.last_hands = []
         self.last_cursor_pos = (0.5, 0.5)
+        self.last_cursor_delta = (0.0, 0.0)
+        self.last_draw_active = False
 
     def close(self) -> None:
         self.camera.release()
@@ -85,15 +87,24 @@ class GestureEngine:
         stable = self.debouncer.stable(event)
         pos = self.last_cursor_pos
         delta = (0.0, 0.0)
-        if g in (Gesture.INDEX_POINTER, Gesture.PINCH_HOLD):
+        cursor_gestures = (Gesture.INDEX_POINTER, Gesture.PINCH, Gesture.PINCH_HOLD)
+        if g in cursor_gestures:
             # Touchpad-style relative cursor movement is much more precise than
-            # absolute webcam mapping. Absolute pos is still updated for fallback.
+            # absolute webcam mapping. It also lets the user keep moving while
+            # touching thumb to index for click/drag, like a real touchpad.
             pos = self._pointer_pos(event, dt)
             delta = self._pointer_delta(event, dt)
-        elif g not in (Gesture.PINCH, Gesture.DOUBLE_PINCH, Gesture.THREE_FINGER_PINCH):
+        elif g not in (Gesture.DOUBLE_PINCH, Gesture.THREE_FINGER_PINCH):
             # Reset the relative filter when the cursor gesture is not active;
             # this avoids a jump when the user returns to pointer mode.
             self.cursor.reset()
+        self.last_cursor_pos = pos
+        self.last_cursor_delta = delta
+        self.last_draw_active = g in (Gesture.PINCH, Gesture.PINCH_HOLD) and phase != "release"
+
+        if getattr(self.config, "whiteboard_mode", False):
+            # Whiteboard mode consumes gestures in the UI and prevents OS mouse/keyboard actions.
+            return
 
         # Volume control: intentional pinch/hold in the left control strip.
         # This prevents normal clicks from becoming volume changes.
@@ -104,6 +115,10 @@ class GestureEngine:
 
         # Mouse movement is continuous and should not wait for debouncing.
         if g == Gesture.INDEX_POINTER and toggles.get("pointer", True):
+            self.actions.pointer_relative(delta)
+
+        elif g == Gesture.PINCH and phase in ("start", "hold") and toggles.get("pointer", True):
+            # Thumb touching index keeps cursor movable. Release triggers the click.
             self.actions.pointer_relative(delta)
 
         # Clicks happen on pinch release, not while fingers touch. This is much more reliable.
@@ -156,7 +171,7 @@ class GestureEngine:
         if hands:
             event = self.recognizer.recognize(hands[0])
             custom = self.trainer.predict(hands[0].landmarks)
-            if custom and self.cooldown.allow(custom.name):
+            if custom and not getattr(self.config, "whiteboard_mode", False) and self.cooldown.allow(custom.name):
                 self._emit(self.actions.execute_custom(custom.action).message)
             self._execute(event, dt)
             if self.config.show_skeleton:
@@ -165,6 +180,8 @@ class GestureEngine:
             if self.actions.dragging:
                 self.actions.drag_relative((0.0, 0.0), False)
             self.cursor.reset()
+            self.last_cursor_delta = (0.0, 0.0)
+            self.last_draw_active = False
         self.last_event = event
         frame = self._draw_hud(frame, event, self.camera.fps, bool(hands))
         return frame, event, self.camera.fps
