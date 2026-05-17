@@ -183,3 +183,31 @@ For the best cursor feel:
 - Use strong front lighting.
 - Set cursor smoothing between 0.45 and 0.65.
 - Lower smoothing if it feels laggy; raise smoothing if it shakes.
+
+## Click + draw interaction upgrade
+
+GestureOS now supports touchpad-style click behavior while moving the pointer:
+
+- **Move cursor:** raise index finger and move your hand.
+- **Left click:** touch thumb to index finger, then release quickly.
+- **Move while thumb is touching:** cursor continues moving while pinched.
+- **Drag:** keep thumb touching index finger for a longer hold, then move.
+- **Release drag:** separate thumb and index.
+- **Right click:** three-finger pinch.
+
+This makes the interaction closer to a laptop touchpad: index finger moves, thumb contact acts as click/press.
+
+## Whiteboard + handwriting recognition
+
+The PyQt6 dashboard includes a **Whiteboard** tab.
+
+How to use it:
+
+1. Open the **Whiteboard** tab.
+2. GestureOS automatically pauses OS mouse/keyboard actions while this tab is active.
+3. Move the canvas cursor with your index finger.
+4. Touch thumb to index and move to draw.
+5. Release thumb to stop drawing.
+6. Click **Recognize Number / Character / Word**.
+
+The recognizer is a lightweight template OCR engine. It works best for clearly drawn single digits and uppercase letters. It can also make a basic connected-component word/sequence guess, but it is not a full neural OCR model.
