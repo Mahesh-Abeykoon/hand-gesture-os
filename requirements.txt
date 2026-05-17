@@ -1,0 +1,11 @@
+opencv-python>=4.9.0
+mediapipe==0.10.14
+numpy>=1.26.0,<2.0.0
+pyautogui>=0.9.54
+keyboard>=0.13.5
+pynput>=1.7.7
+PyQt6>=6.6.0
+pycaw>=20240210; platform_system == "Windows"
+comtypes>=1.4.0; platform_system == "Windows"
+Pillow>=10.2.0
+PyYAML>=6.0.1
