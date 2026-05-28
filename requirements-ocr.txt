@@ -1,0 +1,11 @@
+# Optional advanced OCR dependencies for GestureOS Whiteboard.
+# Install after requirements.txt if you want stronger handwriting/text recognition.
+
+# EasyOCR is easiest for local OCR but downloads its recognition models on first use.
+easyocr>=1.7.1
+
+# Tesseract Python wrapper. You must also install the Tesseract executable separately.
+pytesseract>=0.3.10
+
+# Optional image utilities used by some OCR stacks.
+scikit-image>=0.22.0

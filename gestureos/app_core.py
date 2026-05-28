@@ -13,7 +13,10 @@ from gestureos.settings.config import AppConfig
 from gestureos.utils.logging import get_logger
 from gestureos.vision.camera import Camera
 from gestureos.vision.cursor import CursorMapper
-from gestureos.vision.hand_tracker import HandTracker
+from gestureos.vision.hand_tracker import HandTracker, HandResult
+from gestureos.vision.hand_stabilizer import OpticalFlowPointTracker
+from gestureos.utils.math_utils import dist
+import time
 
 
 class GestureEngine:
@@ -38,6 +41,15 @@ class GestureEngine:
         self.last_cursor_pos = (0.5, 0.5)
         self.last_cursor_delta = (0.0, 0.0)
         self.last_draw_active = False
+        self.precision_pinching = False
+        self.precision_pinch_started = 0.0
+        self.precision_last_release = 0.0
+        self.precision_click_movement = 0.0
+        self.precision_pinch_frames = 0
+        self.precision_release_frames = 0
+        self.precision_dragging = False
+        self.precision_frozen_pos = (0.5, 0.5)
+        self.optical_pointer = OpticalFlowPointTracker(max_age=0.24)
 
     def close(self) -> None:
         self.camera.release()
@@ -74,6 +86,162 @@ class GestureEngine:
 
     def _pointer_delta(self, event: GestureEvent, dt: float) -> Tuple[float, float]:
         return self.cursor.map_relative(event.position, dt)
+
+
+    def _raw_palm_size(self, lm) -> float:
+        return max(0.035, (dist((lm[0][0], lm[0][1]), (lm[9][0], lm[9][1])) + dist((lm[5][0], lm[5][1]), (lm[17][0], lm[17][1]))) / 2.0)
+
+    def _raw_pointer_state(self, hand: HandResult):
+        """Very direct pointer/click state from landmarks, independent of gesture labels."""
+        lm = hand.landmarks
+        palm = self._raw_palm_size(lm)
+        index = (lm[8][0], lm[8][1])
+        thumb = (lm[4][0], lm[4][1])
+        pinch_ratio = dist(index, thumb) / palm
+        # Hysteresis: once down, keep down until fingers separate more.
+        down_threshold = 0.36
+        up_threshold = 0.50
+        pinching = pinch_ratio < (up_threshold if self.precision_pinching else down_threshold)
+        # Pointer can be considered available if index tip is not buried in palm.
+        wrist = (lm[0][0], lm[0][1])
+        index_pip = (lm[6][0], lm[6][1])
+        ring_folded = lm[16][1] > lm[14][1] - 0.015 or dist((lm[16][0], lm[16][1]), wrist) < dist((lm[14][0], lm[14][1]), wrist) + 0.015
+        pinky_folded = lm[20][1] > lm[18][1] - 0.015 or dist((lm[20][0], lm[20][1]), wrist) < dist((lm[18][0], lm[18][1]), wrist) + 0.015
+        pointer_ok = dist(index, wrist) > dist(index_pip, wrist) - 0.02 and ring_folded and pinky_folded
+        return index, pinching, pointer_ok, pinch_ratio
+
+    def _execute_precision_pointer(self, hand: HandResult, event: GestureEvent, dt: float, frame=None) -> bool:
+        """
+        High-priority raw pointer engine.
+
+        This makes clicking/drawing work like a touchpad:
+        - index moves pointer
+        - thumb-index contact = mouse/pen down immediately
+        - release = mouse/pen up/click
+        It is intentionally independent from the symbolic gesture recognizer,
+        because recognizer labels may flicker while the hand is moving.
+        """
+        if not self._active_gate(event):
+            return True
+
+        index, pinching, pointer_ok, pinch_ratio = self._raw_pointer_state(hand)
+        whiteboard_mode = bool(getattr(self.config, "whiteboard_mode", False))
+        if not pointer_ok and not whiteboard_mode:
+            return False
+
+        if frame is not None:
+            self.optical_pointer.update(frame, index)
+
+        pos = self._pointer_pos(GestureEvent(Gesture.INDEX_POINTER, 0.95, index), dt)
+        delta = self._pointer_delta(GestureEvent(Gesture.INDEX_POINTER, 0.95, index), dt)
+        
+        # ── Magnetic Friction / Cursor Slowdown ──
+        # As thumb approaches index, slow down the cursor to allow precise clicking without jumps.
+        down_threshold = 0.36
+        if down_threshold < pinch_ratio < 1.0:
+            slow_factor = max(0.12, (pinch_ratio - down_threshold) / (1.0 - down_threshold))
+            delta = (delta[0] * slow_factor, delta[1] * slow_factor)
+
+        self.last_cursor_pos = pos
+        self.last_cursor_delta = delta
+        self.last_draw_active = pinching
+
+        # Whiteboard/draw mode consumes gestures and draws with index finger only.
+        # Pinch is intentionally ignored here because thumb/index jitter was causing
+        # false strokes. Once the drawing board is open, the index fingertip is the pen.
+        if whiteboard_mode:
+            self.last_draw_active = True
+            self.precision_pinching = False
+            if self.actions.dragging:
+                self.actions.mouse_up()
+            return True
+
+        toggles = self.config.gesture_toggles
+        # Volume strip keeps its previous behavior.
+        if pinching and toggles.get("volume", True) and index[0] < 0.18:
+            if self.cooldown.allow("volume"):
+                self._emit(self.actions.volume_by_position(index[1]).message)
+            self.precision_pinching = pinching
+            return True
+
+        if toggles.get("pointer", True):
+            # Desktop click stabilizer. Cursor moves only while NOT pinching.
+            # During pinch we freeze the cursor to prevent tiny hand shake from
+            # missing the target and clicking the wrong UI element.
+            now = time.perf_counter()
+            if pinching:
+                self.precision_pinch_frames += 1
+                self.precision_release_frames = 0
+                if not self.precision_pinching and self.precision_pinch_frames >= 2:
+                    self.precision_pinching = True
+                    self.precision_pinch_started = now
+                    self.precision_click_movement = 0.0
+                    self.precision_dragging = False
+                    self.precision_frozen_pos = self.last_cursor_pos
+                    # Zero delta history to avoid a jump after release.
+                    self.cursor.last_relative = None
+                    return True
+
+                if self.precision_pinching:
+                    self.precision_click_movement += abs(delta[0]) + abs(delta[1])
+                    held = now - self.precision_pinch_started
+                    # Only become drag after an intentional hold/move. Quick pinches are clicks.
+                    if not self.precision_dragging and (held > 0.34 or self.precision_click_movement > 0.018):
+                        self.actions.mouse_down()
+                        self.precision_dragging = True
+                    if self.precision_dragging:
+                        self.actions.pointer_relative(delta)
+                return True
+
+            # Not pinching: require a couple of release frames before firing click.
+            self.precision_release_frames += 1
+            self.precision_pinch_frames = 0
+            if self.precision_pinching and self.precision_release_frames >= 2:
+                held = now - self.precision_pinch_started
+                if self.precision_dragging:
+                    self.actions.mouse_up()
+                else:
+                    if 0.035 <= held <= 0.50 and self.cooldown.allow("left_click"):
+                        # Click at the frozen target; do not move during click.
+                        self.actions.left_click()
+                        self._emit("Left click")
+                self.precision_pinching = False
+                self.precision_dragging = False
+                self.cursor.last_relative = None
+                return True
+
+            # Normal pointer hover movement.
+            self.actions.pointer_relative(delta)
+            return True
+        return False
+
+    def _execute_optical_fallback(self, frame, dt: float) -> bool:
+        fb = self.optical_pointer.predict(frame)
+        if fb is None:
+            self.last_cursor_delta = (0.0, 0.0)
+            self.last_draw_active = False
+            return False
+        if getattr(self.config, "whiteboard_mode", False):
+            pos = self._pointer_pos(GestureEvent(Gesture.INDEX_POINTER, fb.confidence, fb.point), dt)
+            delta = self._pointer_delta(GestureEvent(Gesture.INDEX_POINTER, fb.confidence, fb.point), dt)
+            self.last_cursor_pos = pos
+            self.last_cursor_delta = delta
+            # In drawing mode the index finger is the pen; bridge short detector drops.
+            self.last_draw_active = fb.age < 0.20
+            return True
+        if self.config.gesture_mode_active or not self.config.activation_required:
+            delta = self._pointer_delta(GestureEvent(Gesture.INDEX_POINTER, fb.confidence, fb.point), dt)
+            self.last_cursor_delta = delta
+            if self.config.gesture_toggles.get("pointer", True):
+                if self.precision_pinching and fb.age < 0.10:
+                    self.actions.pointer_relative(delta)
+                else:
+                    if self.precision_pinching:
+                        self.actions.mouse_up()
+                        self.precision_pinching = False
+                    self.actions.pointer_relative(delta)
+            return True
+        return False
 
     def _execute(self, event: GestureEvent, dt: float) -> None:
         toggles = self.config.gesture_toggles
@@ -173,15 +341,22 @@ class GestureEngine:
             custom = self.trainer.predict(hands[0].landmarks)
             if custom and not getattr(self.config, "whiteboard_mode", False) and self.cooldown.allow(custom.name):
                 self._emit(self.actions.execute_custom(custom.action).message)
-            self._execute(event, dt)
+            consumed = self._execute_precision_pointer(hands[0], event, dt, frame)
+            if not consumed:
+                self._execute(event, dt)
             if self.config.show_skeleton:
                 frame = self.tracker.draw(frame, hands)
         else:
-            if self.actions.dragging:
-                self.actions.drag_relative((0.0, 0.0), False)
-            self.cursor.reset()
-            self.last_cursor_delta = (0.0, 0.0)
-            self.last_draw_active = False
+            bridged = self._execute_optical_fallback(frame, dt)
+            if not bridged:
+                if self.actions.dragging:
+                    self.actions.drag_relative((0.0, 0.0), False)
+                if self.precision_pinching:
+                    self.actions.mouse_up()
+                    self.precision_pinching = False
+                self.cursor.reset()
+                self.last_cursor_delta = (0.0, 0.0)
+                self.last_draw_active = False
         self.last_event = event
         frame = self._draw_hud(frame, event, self.camera.fps, bool(hands))
         return frame, event, self.camera.fps

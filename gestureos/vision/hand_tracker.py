@@ -135,6 +135,11 @@ class HandTracker:
             if results.handedness and i < len(results.handedness):
                 cls = results.handedness[i][0]
                 label, score = cls.category_name, cls.score
+                # Fix mirroring: MediaPipe sees our Right as Left
+                if label == "Right":
+                    label = "Left"
+                elif label == "Left":
+                    label = "Right"
             hands.append(HandResult(lm, label, float(score), bbox))
         return hands
 

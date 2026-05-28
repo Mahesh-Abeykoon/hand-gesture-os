@@ -31,6 +31,8 @@ class ActionController:
         self.screen_w, self.screen_h = get_screen_size()
         self.dragging = False
         self.last_volume_anchor: Optional[float] = None
+        self._rel_x_accum = 0.0
+        self._rel_y_accum = 0.0
 
     def _hotkey(self, *keys: str) -> None:
         if pyautogui:
@@ -52,8 +54,18 @@ class ActionController:
         """Touchpad-style relative pointer movement."""
         if not pyautogui:
             return ActionResult(False, "PyAutoGUI unavailable")
-        dx = int(delta[0] * self.screen_w)
-        dy = int(delta[1] * self.screen_h)
+        # Keep fractional pixel remainders so slow precise movement is not lost
+        # by int() rounding. This makes the cursor feel much less choppy.
+        self._rel_x_accum += delta[0] * self.screen_w
+        self._rel_y_accum += delta[1] * self.screen_h
+        dx = int(self._rel_x_accum)
+        dy = int(self._rel_y_accum)
+        self._rel_x_accum -= dx
+        self._rel_y_accum -= dy
+        # Safety clamp: never allow a one-frame cursor teleport.
+        max_px = max(18, int(min(self.screen_w, self.screen_h) * 0.035))
+        dx = max(-max_px, min(max_px, dx))
+        dy = max(-max_px, min(max_px, dy))
         if dx or dy:
             pyautogui.moveRel(dx, dy, duration=0, _pause=False)
         return ActionResult(True, "Pointer relative move")
@@ -102,6 +114,23 @@ class ActionController:
             pyautogui.mouseUp(_pause=False)
             self.dragging = False
         return ActionResult(True, "Drag relative")
+
+
+    def mouse_down(self) -> ActionResult:
+        if pyautogui:
+            if not self.dragging:
+                pyautogui.mouseDown(_pause=False)
+                self.dragging = True
+            return ActionResult(True, "Mouse down")
+        return ActionResult(False, "PyAutoGUI unavailable")
+
+    def mouse_up(self) -> ActionResult:
+        if pyautogui:
+            if self.dragging:
+                pyautogui.mouseUp(_pause=False)
+                self.dragging = False
+            return ActionResult(True, "Mouse up")
+        return ActionResult(False, "PyAutoGUI unavailable")
 
     def play_pause(self) -> ActionResult:
         self._press("playpause")

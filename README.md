@@ -36,7 +36,7 @@ GestureOS/
 
 ## Setup
 
-> Recommended: Python 3.10–3.13. MediaPipe 0.10.14+ supports Python 3.13.
+> Recommended: Python 3.10 or 3.11. MediaPipe support can lag on the newest Python versions.
 
 ```bash
 cd GestureOS
@@ -137,7 +137,10 @@ python main_qt.py
 Run the legacy dashboard:
 
 ```bash
-python main.py
+python main_tk.py
+```
+
+`python main.py` attempts to start the PyQt6 dashboard first and falls back to Tkinter if PyQt6 is unavailable.
 
 ### PyQt6 dashboard features
 
@@ -211,3 +214,182 @@ How to use it:
 6. Click **Recognize Number / Character / Word**.
 
 The recognizer is a lightweight template OCR engine. It works best for clearly drawn single digits and uppercase letters. It can also make a basic connected-component word/sequence guess, but it is not a full neural OCR model.
+
+
+## Advanced OCR / handwriting recognition
+
+The Whiteboard tab now uses a multi-backend OCR engine:
+
+1. **EasyOCR** if installed — local neural OCR, good for block handwriting and text.
+2. **Tesseract** via `pytesseract` if installed — local OCR engine.
+3. **OCR.space online API** if `OCR_SPACE_API_KEY` is set.
+4. **OpenCV template fallback** — always available for digits and uppercase A-Z.
+
+### Install stronger OCR
+
+Base app:
+
+```bash
+pip install -r requirements.txt
+```
+
+Advanced OCR add-ons:
+
+```bash
+pip install -r requirements-ocr.txt
+```
+
+EasyOCR may download its recognition model on first use and can take time to start.
+
+### Optional Tesseract setup on Windows
+
+`pytesseract` is only the Python wrapper. Install the Tesseract executable too:
+
+- Download installer from: https://github.com/UB-Mannheim/tesseract/wiki
+- Add Tesseract to PATH, or set its location in Python if you customize the app.
+
+### Optional online OCR.space
+
+If you want online OCR fallback, set an API key before starting GestureOS:
+
+```powershell
+$env:OCR_SPACE_API_KEY="your_api_key_here"
+python main_qt.py
+```
+
+If no optional OCR packages are installed, GestureOS still uses the built-in OpenCV template recognizer.
+
+### Whiteboard recognition tips
+
+- Draw large, clear symbols.
+- Digits and uppercase block letters are most reliable.
+- For words, leave space between letters.
+- Press **Recognize Number / Character / Word** after finishing the drawing.
+- Use Clear before drawing a new symbol or word.
+
+## Precision pointer / pen engine upgrade
+
+GestureOS now has a high-priority raw pointer engine that bypasses symbolic gesture labels for mouse and drawing. This is important because symbolic labels can flicker while the hand moves.
+
+Behavior:
+
+- Index finger moves cursor/pen.
+- Thumb touching index immediately presses mouse/pen down.
+- Releasing thumb releases mouse/pen.
+- Quick press/release becomes a normal click.
+- Press + move becomes drag/draw/select.
+- Short MediaPipe dropouts are bridged using optical flow so strokes do not break as easily.
+
+This engine is used for both the desktop cursor and the Whiteboard tab.
+
+## OpenAI Vision OCR option
+
+For the strongest handwritten-note recognition, set an OpenAI API key before launching GestureOS:
+
+```powershell
+$env:OPENAI_API_KEY="your_api_key_here"
+$env:OPENAI_VISION_MODEL="gpt-4o-mini"
+python main_qt.py
+```
+
+When enabled, the Whiteboard recognizer tries OpenAI Vision in addition to EasyOCR, Tesseract, OCR.space, and the built-in template recognizer. This is the most accurate option for messy handwritten notes and words.
+
+
+## Smart anti-jump cursor upgrade
+
+GestureOS now uses a more conservative smart cursor pipeline:
+
+- raw landmark jump rejection
+- sudden movement clamping
+- warm-up frames after hand reacquisition
+- lower acceleration defaults
+- vector-level max speed clamp
+- fractional pixel accumulation for smoother small movement
+
+This prevents the cursor from quickly jumping here and there when MediaPipe briefly swaps or misplaces the fingertip landmark.
+
+Recommended for maximum stability:
+
+```json
+"cursor_smoothing": 0.65,
+"confidence_threshold": 0.60,
+"camera_width": 640,
+"camera_height": 480,
+"target_fps": 60
+```
+
+If the cursor feels too slow, reduce cursor smoothing gradually to `0.50`.
+
+## Full Screen Draw mode
+
+The Whiteboard tab now includes **Open Full Screen Draw**.
+
+When opened:
+
+- the app switches to draw-lock mode
+- desktop cursor/actions are blocked
+- the drawing canvas fills the screen
+- a control panel appears on the right side
+- index finger moves the pen
+- thumb + index draws
+- releasing thumb stops drawing
+- recognition is available from the right-side panel
+
+This is intended for presentations, teaching, note writing, and full-screen gesture drawing.
+
+## Natural handwriting stroke smoothing
+
+The drawing canvas now uses a paper-like stroke engine instead of direct frame-to-frame lines:
+
+- hidden pen cursor by default, so the cursor indicator does not disturb the drawing
+- conservative canvas motion gain
+- per-frame speed limit
+- low-pass smoothing for pen motion
+- no jump line when thumb first touches index
+- quadratic Bézier interpolation for smooth handwriting curves
+- full-screen canvas fills the drawing area while the right-side control panel remains available
+
+In Full Screen Draw mode, the user sees only the white board and the right-side tools; the moving pointer indicator is hidden.
+
+## Draw mode behavior change: index-only drawing
+
+Whiteboard and Full Screen Draw now intentionally ignore pinch for drawing.
+
+Reason: thumb-index pinch causes landmark occlusion and fingertip jitter, which created false strokes and broken lines. In drawing mode GestureOS now behaves like this:
+
+- Open Whiteboard / Full Screen Draw = desktop actions locked.
+- Index fingertip = pen.
+- Index movement draws directly on the board.
+- No visible pen cursor is shown.
+- Pinch is reserved for desktop click mode only, not drawing mode.
+- Move hand out of camera view to stop drawing.
+
+The board now uses absolute camera-to-board mapping rather than mouse-style relative deltas, which makes handwriting easier and less broken.
+
+An **Instructions** tab was also added to the PyQt dashboard.
+
+## Precision click and drawing redesign
+
+GestureOS now separates **desktop clicking** from **drawing** more carefully.
+
+### Desktop click mode
+
+- Index finger moves cursor.
+- Thumb + index no longer instantly drags/clicks.
+- When thumb/index touch, the cursor freezes on the target.
+- Quick stable release triggers one click at the frozen position.
+- Hold or deliberate movement becomes drag.
+
+This prevents tiny hand shake during a pinch from moving the cursor away from the intended button.
+
+### Drawing mode tools
+
+Whiteboard and Full Screen Draw now include tools:
+
+- **Pen**: index finger draws.
+- **Hover / Pause**: index finger moves without drawing.
+- **Eraser**: index finger erases.
+- **Clear**: clears the board.
+- **Recognize Notes**: OCR recognition.
+
+Full Screen Draw now also shows a right-side live camera preview, so the user can see the tracked hand while drawing. The drawing cursor indicator remains hidden to avoid disturbing the handwriting.
