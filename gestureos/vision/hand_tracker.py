@@ -51,7 +51,7 @@ class HandTracker:
     on every frame.
     """
 
-    def __init__(self, max_hands: int = 1, min_detection_confidence: float = 0.55, min_tracking_confidence: float = 0.55):
+    def __init__(self, max_hands: int = 1, min_detection_confidence: float = 0.50, min_tracking_confidence: float = 0.35):
         try:
             from mediapipe.tasks.python.vision.hand_landmarker import HandLandmarker, HandLandmarkerOptions
             from mediapipe.tasks.python.vision.hand_landmarker import HandLandmarksConnections

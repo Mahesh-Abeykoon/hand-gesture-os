@@ -61,16 +61,16 @@ class OneEuroFilter:
 class CursorSettings:
     margin_x: float = 0.16
     margin_y: float = 0.12
-    deadzone: float = 0.0025
-    gain: float = 1.12
-    min_cutoff: float = 1.25
-    beta: float = 0.035
-    relative_gain: float = 2.35
-    relative_deadzone: float = 0.0012
-    max_step: float = 0.026
-    raw_jump_limit: float = 0.055
-    raw_hard_reset_jump: float = 0.23
-    raw_step_soft_limit: float = 0.035
+    deadzone: float = 0.004
+    gain: float = 1.05
+    min_cutoff: float = 1.0
+    beta: float = 0.025
+    relative_gain: float = 2.0
+    relative_deadzone: float = 0.002
+    max_step: float = 0.022
+    raw_jump_limit: float = 0.050
+    raw_hard_reset_jump: float = 0.20
+    raw_step_soft_limit: float = 0.030
 
 
 class CursorMapper:

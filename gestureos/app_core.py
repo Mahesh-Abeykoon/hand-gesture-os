@@ -47,9 +47,10 @@ class GestureEngine:
         self.precision_click_movement = 0.0
         self.precision_pinch_frames = 0
         self.precision_release_frames = 0
+        self.precision_pinch_grace = 0   # absorbs 1-2 frame landmark dropout during pinch
         self.precision_dragging = False
         self.precision_frozen_pos = (0.5, 0.5)
-        self.optical_pointer = OpticalFlowPointTracker(max_age=0.24)
+        self.optical_pointer = OpticalFlowPointTracker(max_age=0.40)
 
     def close(self) -> None:
         self.camera.release()
@@ -98,9 +99,9 @@ class GestureEngine:
         index = (lm[8][0], lm[8][1])
         thumb = (lm[4][0], lm[4][1])
         pinch_ratio = dist(index, thumb) / palm
-        # Hysteresis: once down, keep down until fingers separate more.
-        down_threshold = 0.36
-        up_threshold = 0.50
+        # Hysteresis: wider thresholds so the user doesn't need to press insanely hard.
+        down_threshold = 0.42
+        up_threshold = 0.62
         pinching = pinch_ratio < (up_threshold if self.precision_pinching else down_threshold)
         # Pointer can be considered available if index tip is not buried in palm.
         wrist = (lm[0][0], lm[0][1])
@@ -114,12 +115,12 @@ class GestureEngine:
         """
         High-priority raw pointer engine.
 
-        This makes clicking/drawing work like a touchpad:
-        - index moves pointer
-        - thumb-index contact = mouse/pen down immediately
-        - release = mouse/pen up/click
-        It is intentionally independent from the symbolic gesture recognizer,
-        because recognizer labels may flicker while the hand is moving.
+        Critical design: cursor movement and click are COMPLETELY SEPARATED.
+        - While NOT pinching: index finger moves cursor freely.
+        - The MOMENT pinch starts: cursor FREEZES. No delta is computed.
+          The internal cursor filter is also frozen so no drift accumulates.
+        - On release: click fires at the frozen position.
+        - For drag: only after holding 400ms does cursor movement resume.
         """
         if not self._active_gate(event):
             return True
@@ -132,23 +133,29 @@ class GestureEngine:
         if frame is not None:
             self.optical_pointer.update(frame, index)
 
-        pos = self._pointer_pos(GestureEvent(Gesture.INDEX_POINTER, 0.95, index), dt)
-        delta = self._pointer_delta(GestureEvent(Gesture.INDEX_POINTER, 0.95, index), dt)
-        
-        # ── Magnetic Friction / Cursor Slowdown ──
-        # As thumb approaches index, slow down the cursor to allow precise clicking without jumps.
-        down_threshold = 0.36
-        if down_threshold < pinch_ratio < 1.0:
-            slow_factor = max(0.12, (pinch_ratio - down_threshold) / (1.0 - down_threshold))
-            delta = (delta[0] * slow_factor, delta[1] * slow_factor)
+        # ── KEY FIX: Only compute cursor movement when NOT pinching ──
+        # Previously, _pointer_pos/_pointer_delta were called every frame,
+        # which kept advancing the filter even during pinch, causing drift.
+        if not self.precision_pinching:
+            pos = self._pointer_pos(GestureEvent(Gesture.INDEX_POINTER, 0.95, index), dt)
+            delta = self._pointer_delta(GestureEvent(Gesture.INDEX_POINTER, 0.95, index), dt)
 
-        self.last_cursor_pos = pos
-        self.last_cursor_delta = delta
+            # Magnetic friction: as thumb approaches, slow cursor
+            down_threshold = 0.42
+            if down_threshold < pinch_ratio < 1.2:
+                slow_factor = max(0.08, (pinch_ratio - down_threshold) / (1.2 - down_threshold))
+                delta = (delta[0] * slow_factor, delta[1] * slow_factor)
+
+            self.last_cursor_pos = pos
+            self.last_cursor_delta = delta
+        else:
+            # Pinching: cursor is frozen. Do NOT touch the filter.
+            delta = (0.0, 0.0)
+            self.last_cursor_delta = delta
+
         self.last_draw_active = pinching
 
-        # Whiteboard/draw mode consumes gestures and draws with index finger only.
-        # Pinch is intentionally ignored here because thumb/index jitter was causing
-        # false strokes. Once the drawing board is open, the index fingertip is the pen.
+        # Whiteboard/draw mode
         if whiteboard_mode:
             self.last_draw_active = True
             self.precision_pinching = False
@@ -157,7 +164,7 @@ class GestureEngine:
             return True
 
         toggles = self.config.gesture_toggles
-        # Volume strip keeps its previous behavior.
+        # Volume strip
         if pinching and toggles.get("volume", True) and index[0] < 0.18:
             if self.cooldown.allow("volume"):
                 self._emit(self.actions.volume_by_position(index[1]).message)
@@ -165,52 +172,72 @@ class GestureEngine:
             return True
 
         if toggles.get("pointer", True):
-            # Desktop click stabilizer. Cursor moves only while NOT pinching.
-            # During pinch we freeze the cursor to prevent tiny hand shake from
-            # missing the target and clicking the wrong UI element.
             now = time.perf_counter()
+
             if pinching:
-                self.precision_pinch_frames += 1
                 self.precision_release_frames = 0
-                if not self.precision_pinching and self.precision_pinch_frames >= 2:
+                self.precision_pinch_grace = 0
+                self.precision_pinch_frames += 1
+
+                if not self.precision_pinching and self.precision_pinch_frames >= 1:
+                    # ── Pinch just started: freeze cursor immediately ──
                     self.precision_pinching = True
                     self.precision_pinch_started = now
                     self.precision_click_movement = 0.0
                     self.precision_dragging = False
                     self.precision_frozen_pos = self.last_cursor_pos
-                    # Zero delta history to avoid a jump after release.
+                    # Freeze the filter state so no drift accumulates.
                     self.cursor.last_relative = None
                     return True
 
                 if self.precision_pinching:
-                    self.precision_click_movement += abs(delta[0]) + abs(delta[1])
                     held = now - self.precision_pinch_started
-                    # Only become drag after an intentional hold/move. Quick pinches are clicks.
-                    if not self.precision_dragging and (held > 0.34 or self.precision_click_movement > 0.018):
-                        self.actions.mouse_down()
-                        self.precision_dragging = True
+                    if not self.precision_dragging:
+                        # Only become drag after intentional hold (>400ms).
+                        # Do NOT accumulate movement — cursor is frozen.
+                        if held > 0.40:
+                            self.actions.mouse_down()
+                            self.precision_dragging = True
+                            # Re-initialize cursor filter for drag movement.
+                            self.cursor.last_relative = None
                     if self.precision_dragging:
-                        self.actions.pointer_relative(delta)
+                        # During drag, re-enable cursor movement.
+                        drag_pos = self._pointer_pos(GestureEvent(Gesture.INDEX_POINTER, 0.95, index), dt)
+                        drag_delta = self._pointer_delta(GestureEvent(Gesture.INDEX_POINTER, 0.95, index), dt)
+                        self.actions.pointer_relative(drag_delta)
+                        self.last_cursor_pos = drag_pos
                 return True
 
-            # Not pinching: require a couple of release frames before firing click.
-            self.precision_release_frames += 1
+            # ── Not pinching ──
             self.precision_pinch_frames = 0
-            if self.precision_pinching and self.precision_release_frames >= 2:
-                held = now - self.precision_pinch_started
-                if self.precision_dragging:
-                    self.actions.mouse_up()
-                else:
-                    if 0.035 <= held <= 0.50 and self.cooldown.allow("left_click"):
-                        # Click at the frozen target; do not move during click.
-                        self.actions.left_click()
-                        self._emit("Left click")
-                self.precision_pinching = False
-                self.precision_dragging = False
-                self.cursor.last_relative = None
+
+            if self.precision_pinching:
+                self.precision_pinch_grace += 1
+                # Grace: absorb up to 3 frames of dropout during pinch.
+                if self.precision_pinch_grace <= 3:
+                    return True
+
+                self.precision_release_frames += 1
+                if self.precision_release_frames >= 1:
+                    held = now - self.precision_pinch_started
+                    if self.precision_dragging:
+                        self.actions.mouse_up()
+                        self._emit("Drag end")
+                    else:
+                        # Click: any pinch from 30ms to 2s.
+                        if 0.030 <= held <= 2.0 and self.cooldown.allow("left_click"):
+                            # Move cursor to frozen target, then click.
+                            self.actions.pointer(self.precision_frozen_pos)
+                            self.actions.left_click()
+                            self._emit("Left click")
+                    self.precision_pinching = False
+                    self.precision_dragging = False
+                    self.precision_pinch_grace = 0
+                    # Reset filter for clean hover after click.
+                    self.cursor.reset()
                 return True
 
-            # Normal pointer hover movement.
+            # ── Normal pointer hover ──
             self.actions.pointer_relative(delta)
             return True
         return False
