@@ -35,6 +35,8 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QStackedWidget,
+    QFileDialog,
     QTabWidget,
     QTextEdit,
     QVBoxLayout,
@@ -770,6 +772,7 @@ class GestureOSQtApp(QMainWindow):
 
         left = QVBoxLayout()
         main.addLayout(left, 3)
+
         self.video_card = QFrame(); self.video_card.setObjectName("Card")
         video_layout = QVBoxLayout(self.video_card)
         self.video = QLabel("Starting camera...")
@@ -790,7 +793,7 @@ class GestureOSQtApp(QMainWindow):
             "QPushButton#Danger:hover { background: #991b1b; }"
             "QPushButton#Magic { background: #8b5cf6; color: white; }"
             "QPushButton#Magic:hover { background: #7c3aed; }"
-            "QLabel { color: #94a3b8; font-size: 12px; font-weight: 500; border: none; }"
+            "QLabel { color: #cbd5e1; font-size: 13px; font-weight: 500; border: none; }"
         )
         self.draw_bar_widget.hide()  # Hidden until Whiteboard tab is selected
         draw_bar = QHBoxLayout(self.draw_bar_widget)
@@ -802,9 +805,9 @@ class GestureOSQtApp(QMainWindow):
         self._dera = QPushButton("◻ Eraser")
         self._dclr = QPushButton("✕ Clear")
         self._dclr.setObjectName("Danger")
-        self._dsave = QPushButton("💾 Save Image")
         self._dfix = QPushButton("✨ Auto-Fix")
         self._dfix.setObjectName("Magic")
+        self._dsave = QPushButton("💾 Save Image")
         self._dtool = "pen"   # current draw tool for camera ink
         
         self._dpen.clicked.connect(lambda: self._set_draw_tool("pen"))
@@ -856,6 +859,7 @@ class GestureOSQtApp(QMainWindow):
         self.right_tabs.addTab(self._diagnostics_tab(), "Diagnostics")
         self.right_tabs.addTab(self._trainer_tab(), "Trainer")
         self.right_tabs.currentChanged.connect(self._tab_changed)
+        self._tab_changed(0)
 
     def _controls_tab(self) -> QWidget:
         tab = QWidget(); layout = QVBoxLayout(tab)
@@ -990,43 +994,27 @@ class GestureOSQtApp(QMainWindow):
     def _whiteboard_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-
-        self.whiteboard = WhiteboardCanvas()
-        layout.addWidget(self.whiteboard, 1)
-
-        # Only essential controls — no redundant Pen/Eraser/Hover buttons
-        bar = QHBoxLayout()
-        bar.setContentsMargins(6, 2, 6, 2)
-        clear_btn = QPushButton("Clear")
-        clear_btn.setObjectName("Danger")
-        clear_btn.clicked.connect(lambda: (
-            self.whiteboard.clear(),
-            self.whiteboard_result.setText("Draw, then click Recognize."),
-        ))
-        recog_btn = QPushButton("Recognize")
-        recog_btn.setObjectName("Primary")
-        recog_btn.clicked.connect(self._recognize_whiteboard)
-        full_btn = QPushButton("Full Screen Draw")
-        full_btn.setObjectName("Success")
-        full_btn.clicked.connect(self._open_fullscreen_draw)
-        self.pen_slider = QSlider(Qt.Orientation.Horizontal)
-        self.pen_slider.setRange(2, 18)
-        self.pen_slider.setValue(7)
-        self.pen_slider.setFixedWidth(90)
-        self.pen_slider.valueChanged.connect(self.whiteboard.set_pen_width)
-        bar.addWidget(clear_btn)
-        bar.addWidget(recog_btn)
-        bar.addWidget(full_btn)
-        bar.addWidget(QLabel("Size:"))
-        bar.addWidget(self.pen_slider)
-        layout.addLayout(bar)
-
-        self.whiteboard_result = QLabel("Draw, then click Recognize.")
-        self.whiteboard_result.setObjectName("Subtitle")
-        self.whiteboard_result.setWordWrap(True)
-        layout.addWidget(self.whiteboard_result)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+        
+        # Small clean preview card (white drawing paper style)
+        preview_card = QFrame()
+        preview_card.setObjectName("Card")
+        preview_layout = QVBoxLayout(preview_card)
+        preview_layout.setContentsMargins(8, 8, 8, 8)
+        
+        self.whiteboard_preview = QLabel("Drawing Preview")
+        self.whiteboard_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.whiteboard_preview.setMinimumHeight(240)
+        self.whiteboard_preview.setStyleSheet("background:#ffffff; border-radius:12px; border: 1px solid #1e2947;")
+        
+        preview_layout.addWidget(self.whiteboard_preview)
+        layout.addWidget(preview_card, 1)
+        
+        self.mini_status = QLabel("Clean Canvas Preview")
+        self.mini_status.setObjectName("Subtitle")
+        self.mini_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.mini_status)
         return tab
 
     def _trainer_tab(self) -> QWidget:
@@ -1078,21 +1066,22 @@ class GestureOSQtApp(QMainWindow):
     def _set_draw_tool(self, t: str):
         self._dtool = t
         self._ink_prev = None
+        self._dstatus.setText(f"Tool: {t.upper()}")
 
     def _clear_ink(self):
         if self._ink is not None:
             self._ink[:] = 255
         self._ink_prev = None
+        self._dstatus.setText("Cleared")
 
     def _save_ink(self):
         if self._ink is None:
             return
         filename, _ = QFileDialog.getSaveFileName(self, "Save Drawing", "", "Images (*.png *.jpg)")
         if filename:
-            # We must blend the ink with a black or white background, or save as is
-            # Right now _ink has white (255) as background and dark as pen. Let's just save the ink buffer.
             cv2.imwrite(filename, self._ink)
             self._log(f"Drawing saved to {filename}")
+            self._dstatus.setText("Saved")
 
     def _auto_fix_ink(self):
         if self._ink is None: return
@@ -1115,6 +1104,7 @@ class GestureOSQtApp(QMainWindow):
             tx, ty = x + (w - ts[0]) // 2, y + (h + ts[1]) // 2
             cv2.putText(self._ink, best.text, (tx, ty), font, fs, (20, 24, 32), th, cv2.LINE_AA)
             self._log(f"Auto-fixed to text: {best.text}")
+            self._dstatus.setText(f"Text: {best.text}")
             return
             
         # 2. Try shape detection
@@ -1129,6 +1119,7 @@ class GestureOSQtApp(QMainWindow):
                     self._ink[:] = 255
                     cv2.drawContours(self._ink, [approx], -1, (20, 24, 32), max(3, int(w/50)))
                     self._log("Auto-fixed to Rectangle")
+                    self._dstatus.setText("Fixed to Rectangle")
                 else:
                     (cx, cy), radius = cv2.minEnclosingCircle(c)
                     circle_area = np.pi * (radius**2)
@@ -1136,6 +1127,7 @@ class GestureOSQtApp(QMainWindow):
                         self._ink[:] = 255
                         cv2.circle(self._ink, (int(cx), int(cy)), int(radius), (20, 24, 32), max(3, int(w/50)), cv2.LINE_AA)
                         self._log("Auto-fixed to Circle")
+                        self._dstatus.setText("Fixed to Circle")
 
     @pyqtSlot(QImage, str, float, float, bool, bool, float, float, float, float, bool)
     def _on_frame(self, img: QImage, gesture: str, confidence: float, fps: float,
@@ -1157,9 +1149,9 @@ class GestureOSQtApp(QMainWindow):
             self._ink_w, self._ink_h = fw, fh
             self._ink_prev = None
 
+        is_whiteboard_tab = (hasattr(self, "whiteboard_tab_widget") and self.right_tabs.currentWidget() is self.whiteboard_tab_widget)
+        
         # ── Draw into ink buffer when hand is seen & active ───────────────
-        is_whiteboard_tab = (hasattr(self, "whiteboard") and self.right_tabs.currentWidget() is self.whiteboard_tab_widget)
-        # Pinch stops drawing (acts as lifting the pen)
         drawing = bool(hand_seen and active and self._dtool != "eraser_noop" and is_whiteboard_tab and gesture != "pinch")
         if drawing:
             # EMA smooth (reject teleports > 20% of frame)
@@ -1167,8 +1159,8 @@ class GestureOSQtApp(QMainWindow):
                 self._ink_sx, self._ink_sy = cx, cy
                 self._ink_sinit = True
             else:
-                dist = math.hypot(cx - self._ink_sx, cy - self._ink_sy)
-                if dist < 0.20:
+                dist_px = math.hypot(cx - self._ink_sx, cy - self._ink_sy)
+                if dist_px < 0.20:
                     a = 0.55
                     self._ink_sx += a * (cx - self._ink_sx)
                     self._ink_sy += a * (cy - self._ink_sy)
@@ -1202,6 +1194,7 @@ class GestureOSQtApp(QMainWindow):
                 frame_bgr[mask].astype(np.float32) * 0.15
                 + self._ink[mask].astype(np.float32) * 0.85
             ).astype(np.uint8)
+            
         out_rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
         h, w, ch = out_rgb.shape
         display_img = QImage(out_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
@@ -1213,6 +1206,17 @@ class GestureOSQtApp(QMainWindow):
             Qt.TransformationMode.SmoothTransformation,
         )
         self.video.setPixmap(pix)
+        
+        # ── Display clean drawing preview on the right tab if active ──
+        if is_whiteboard_tab:
+            ink_rgb = cv2.cvtColor(self._ink, cv2.COLOR_BGR2RGB)
+            ink_img = QImage(ink_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
+            pix_ink = QPixmap.fromImage(ink_img).scaled(
+                self.whiteboard_preview.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self.whiteboard_preview.setPixmap(pix_ink)
 
         # ── Metrics & other panels ──────────────────────────────────
         self.fps_card.set_value(f"{fps:.1f}")
@@ -1226,8 +1230,6 @@ class GestureOSQtApp(QMainWindow):
         self.conf_graph.add(confidence)
         state = "DRAWING" if (hand_seen and active) else "HOVER"
         self._dstatus.setText(f"{state} | {self._dtool.upper()}")
-        if hasattr(self, "whiteboard") and self.right_tabs.currentWidget() is self.whiteboard_tab_widget:
-            self.whiteboard.update_from_absolute(cx, cy, hand_seen and active)
         if getattr(self, "fullscreen_draw", None) is not None and self.fullscreen_draw.isVisible():
             self.fullscreen_draw.update_camera(img)
             self.fullscreen_draw.update_from_absolute(cx, cy, hand_seen and active)
@@ -1244,15 +1246,9 @@ class GestureOSQtApp(QMainWindow):
         if enabled:
             self.config_data.gesture_mode_active = True
             self.setActiveRequested.emit(True)
+            self._log("Whiteboard mode: OS actions paused; gestures draw on camera screen")
+            
         self.whiteboardModeRequested.emit(bool(enabled))
-        if enabled:
-            self._log("Whiteboard mode: OS actions paused; gestures draw on canvas")
-
-    def _recognize_whiteboard(self):
-        if not hasattr(self, "whiteboard"):
-            return
-        single, sequence = self.whiteboard.recognize()
-        self.whiteboard_result.setText(single + (f"\n{sequence}" if sequence else ""))
 
 
     def _open_fullscreen_draw(self):

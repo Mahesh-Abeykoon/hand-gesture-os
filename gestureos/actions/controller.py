@@ -50,6 +50,18 @@ class ActionController:
         pyautogui.moveTo(int(x * self.screen_w), int(y * self.screen_h), duration=0, _pause=False)
         return ActionResult(True, "Pointer move")
 
+    def get_cursor_position(self) -> Tuple[int, int]:
+        if pyautogui:
+            return pyautogui.position()
+        return (0, 0)
+
+    def pointer_absolute_pixel(self, x: int, y: int) -> ActionResult:
+        if pyautogui:
+            pyautogui.moveTo(x, y, duration=0, _pause=False)
+            return ActionResult(True, "Pointer absolute pixel move")
+        return ActionResult(False, "PyAutoGUI unavailable")
+
+
     def pointer_relative(self, delta: Tuple[float, float]) -> ActionResult:
         """Touchpad-style relative pointer movement."""
         if not pyautogui:

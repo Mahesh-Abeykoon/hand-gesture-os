@@ -27,7 +27,11 @@ class GestureEngine:
         self.log = get_logger("GestureOS.Engine")
         self.on_log = on_log or (lambda msg: None)
         self.camera = Camera(config.camera_index, config.camera_width, config.camera_height, config.target_fps)
-        self.tracker = HandTracker(max_hands=2 if config.dual_hand_mode else 1)
+        self.tracker = HandTracker(
+            max_hands=2 if config.dual_hand_mode else 1,
+            min_detection_confidence=max(0.55, config.confidence_threshold),
+            min_tracking_confidence=max(0.50, config.confidence_threshold - 0.05)
+        )
         self.recognizer = GestureRecognizer(config.sensitivity)
         self.debouncer = GestureDebouncer(threshold=config.confidence_threshold)
         self.cooldown = CooldownGate(config.cooldowns)
@@ -50,6 +54,10 @@ class GestureEngine:
         self.precision_pinch_grace = 0   # absorbs 1-2 frame landmark dropout during pinch
         self.precision_dragging = False
         self.precision_frozen_pos = (0.5, 0.5)
+        self.os_cursor_history: List[Tuple[int, int]] = []
+        self.precision_frozen_os_pos = (0, 0)
+        self.pre_pinching = False
+        self.pre_pinch_frozen_os_pos = None
         self.optical_pointer = OpticalFlowPointTracker(max_age=0.40)
 
     def close(self) -> None:
@@ -133,38 +141,77 @@ class GestureEngine:
         if frame is not None:
             self.optical_pointer.update(frame, index)
 
-        # ── KEY FIX: Only compute cursor movement when NOT pinching ──
-        # Previously, _pointer_pos/_pointer_delta were called every frame,
-        # which kept advancing the filter even during pinch, causing drift.
-        if not self.precision_pinching:
-            pos = self._pointer_pos(GestureEvent(Gesture.INDEX_POINTER, 0.95, index), dt)
-            delta = self._pointer_delta(GestureEvent(Gesture.INDEX_POINTER, 0.95, index), dt)
+        now = time.perf_counter()
+        toggles = self.config.gesture_toggles
 
-            # Magnetic friction: as thumb approaches, slow cursor
-            down_threshold = 0.42
-            if down_threshold < pinch_ratio < 1.2:
-                slow_factor = max(0.08, (pinch_ratio - down_threshold) / (1.2 - down_threshold))
-                delta = (delta[0] * slow_factor, delta[1] * slow_factor)
+        # ── Double-stage Tremor-proof Click Snap Logic ──
+        # 1. Hover stage: pinch_ratio >= 0.65
+        if pinch_ratio >= 0.65:
+            self.pre_pinching = False
+            self.pre_pinch_frozen_os_pos = None
 
-            self.last_cursor_pos = pos
-            self.last_cursor_delta = delta
+            if not self.precision_pinching:
+                # Normal hover relative tracking
+                pos = self._pointer_pos(GestureEvent(Gesture.INDEX_POINTER, 0.95, index), dt)
+                delta = self._pointer_delta(GestureEvent(Gesture.INDEX_POINTER, 0.95, index), dt)
+
+                # Magnetic friction: slow cursor as fingers approach 0.65
+                if 0.65 < pinch_ratio < 1.1:
+                    slow_factor = (pinch_ratio - 0.65) / (1.1 - 0.65)
+                    slow_factor = max(0.1, slow_factor)
+                    delta = (delta[0] * slow_factor, delta[1] * slow_factor)
+
+                self.last_cursor_pos = pos
+                self.last_cursor_delta = delta
+
+                # Move OS pointer relatively
+                if toggles.get("pointer", True) and not whiteboard_mode:
+                    self.actions.pointer_relative(delta)
+
+                # Keep track of actual OS cursor positions in hover history
+                cur_os = self.actions.get_cursor_position()
+                self.os_cursor_history.append(cur_os)
+                self.os_cursor_history[:] = self.os_cursor_history[-10:]
+            else:
+                # During active pinch hold, cursor is locked
+                delta = (0.0, 0.0)
+                self.last_cursor_delta = delta
+
+        # 2. Pre-pinch / Freeze stage: pinch_ratio < 0.65
         else:
-            # Pinching: cursor is frozen. Do NOT touch the filter.
             delta = (0.0, 0.0)
             self.last_cursor_delta = delta
 
+            if not self.pre_pinching:
+                self.pre_pinching = True
+                # Lock target at the OS cursor position from 5 frames ago to absorb pre-pinch drift
+                if len(self.os_cursor_history) >= 5:
+                    self.pre_pinch_frozen_os_pos = self.os_cursor_history[-5]
+                elif self.os_cursor_history:
+                    self.pre_pinch_frozen_os_pos = self.os_cursor_history[0]
+                else:
+                    self.pre_pinch_frozen_os_pos = self.actions.get_cursor_position()
+
+                # Freeze the cursor filter
+                self.cursor.last_relative = None
+
+            # Actively hold the OS cursor rock-solid at the frozen target
+            if self.pre_pinch_frozen_os_pos and not self.precision_dragging and not whiteboard_mode:
+                self.actions.pointer_absolute_pixel(*self.pre_pinch_frozen_os_pos)
+
         self.last_draw_active = pinching
 
-        # Whiteboard/draw mode
+        # Whiteboard/draw mode: index-only drawing, pinch is paused
         if whiteboard_mode:
             self.last_draw_active = True
             self.precision_pinching = False
+            self.pre_pinching = False
+            self.pre_pinch_frozen_os_pos = None
             if self.actions.dragging:
                 self.actions.mouse_up()
             return True
 
-        toggles = self.config.gesture_toggles
-        # Volume strip
+        # Volume strip (left edge)
         if pinching and toggles.get("volume", True) and index[0] < 0.18:
             if self.cooldown.allow("volume"):
                 self._emit(self.actions.volume_by_position(index[1]).message)
@@ -172,49 +219,46 @@ class GestureEngine:
             return True
 
         if toggles.get("pointer", True):
-            now = time.perf_counter()
-
             if pinching:
                 self.precision_release_frames = 0
                 self.precision_pinch_grace = 0
                 self.precision_pinch_frames += 1
 
                 if not self.precision_pinching and self.precision_pinch_frames >= 1:
-                    # ── Pinch just started: freeze cursor immediately ──
                     self.precision_pinching = True
                     self.precision_pinch_started = now
-                    self.precision_click_movement = 0.0
                     self.precision_dragging = False
                     self.precision_frozen_pos = self.last_cursor_pos
-                    # Freeze the filter state so no drift accumulates.
-                    self.cursor.last_relative = None
-                    return True
 
                 if self.precision_pinching:
                     held = now - self.precision_pinch_started
                     if not self.precision_dragging:
-                        # Only become drag after intentional hold (>400ms).
-                        # Do NOT accumulate movement — cursor is frozen.
+                        # Keep locking the OS cursor
+                        if self.pre_pinch_frozen_os_pos:
+                            self.actions.pointer_absolute_pixel(*self.pre_pinch_frozen_os_pos)
+                        
+                        # Hold > 400ms starts dragging
                         if held > 0.40:
                             self.actions.mouse_down()
                             self.precision_dragging = True
-                            # Re-initialize cursor filter for drag movement.
                             self.cursor.last_relative = None
-                    if self.precision_dragging:
-                        # During drag, re-enable cursor movement.
+                    else:
+                        # Dragging: move relatively
                         drag_pos = self._pointer_pos(GestureEvent(Gesture.INDEX_POINTER, 0.95, index), dt)
                         drag_delta = self._pointer_delta(GestureEvent(Gesture.INDEX_POINTER, 0.95, index), dt)
                         self.actions.pointer_relative(drag_delta)
                         self.last_cursor_pos = drag_pos
                 return True
 
-            # ── Not pinching ──
+            # Not fully pinching
             self.precision_pinch_frames = 0
 
             if self.precision_pinching:
                 self.precision_pinch_grace += 1
-                # Grace: absorb up to 3 frames of dropout during pinch.
+                # Absorb brief dropout frames
                 if self.precision_pinch_grace <= 3:
+                    if self.pre_pinch_frozen_os_pos and not self.precision_dragging:
+                        self.actions.pointer_absolute_pixel(*self.pre_pinch_frozen_os_pos)
                     return True
 
                 self.precision_release_frames += 1
@@ -224,21 +268,21 @@ class GestureEngine:
                         self.actions.mouse_up()
                         self._emit("Drag end")
                     else:
-                        # Click: any pinch from 30ms to 2s.
+                        # Left click at frozen target
                         if 0.030 <= held <= 2.0 and self.cooldown.allow("left_click"):
-                            # Move cursor to frozen target, then click.
-                            self.actions.pointer(self.precision_frozen_pos)
+                            if self.pre_pinch_frozen_os_pos:
+                                self.actions.pointer_absolute_pixel(*self.pre_pinch_frozen_os_pos)
                             self.actions.left_click()
                             self._emit("Left click")
+                    
                     self.precision_pinching = False
                     self.precision_dragging = False
                     self.precision_pinch_grace = 0
-                    # Reset filter for clean hover after click.
+                    self.pre_pinching = False
+                    self.pre_pinch_frozen_os_pos = None
                     self.cursor.reset()
                 return True
 
-            # ── Normal pointer hover ──
-            self.actions.pointer_relative(delta)
             return True
         return False
 
@@ -399,13 +443,105 @@ class GestureEngine:
     def _draw_hud(self, frame, event: GestureEvent, fps: float, hand_seen: bool):
         h, w = frame.shape[:2]
         active = self.config.gesture_mode_active or not self.config.activation_required
-        color = (80, 220, 120) if active else (70, 90, 120)
-        cv2.rectangle(frame, (14, 14), (430, 116), (10, 12, 18), -1)
-        cv2.rectangle(frame, (14, 14), (430, 116), color, 2)
-        cv2.putText(frame, "GestureOS", (28, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (245, 245, 245), 2, cv2.LINE_AA)
-        cv2.putText(frame, f"Mode: {'ACTIVE' if active else 'STANDBY'}   Hand: {'LOCKED' if hand_seen else 'NO HAND'}", (28, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
-        cv2.putText(frame, f"Gesture: {event.gesture.value}  Conf: {event.confidence:.2f}  FPS: {fps:.1f}", (28, 98), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (220, 230, 240), 1, cv2.LINE_AA)
-        # Left-edge volume zone hint.
-        cv2.rectangle(frame, (0, 0), (int(w * 0.18), h), (40, 80, 120), 1)
-        cv2.putText(frame, "VOL", (10, h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (120, 180, 255), 1, cv2.LINE_AA)
+        bracket_color = (255, 200, 80) if active else (130, 110, 95)  # Neon Cyan-Blue in BGR
+        
+        # 1. Sleek tactical corner brackets on the camera viewport edges
+        bracket_len = 24
+        bracket_thick = 2
+        # Top Left
+        cv2.line(frame, (8, 8), (8 + bracket_len, 8), bracket_color, bracket_thick)
+        cv2.line(frame, (8, 8), (8, 8 + bracket_len), bracket_color, bracket_thick)
+        # Top Right
+        cv2.line(frame, (w - 8, 8), (w - 8 - bracket_len, 8), bracket_color, bracket_thick)
+        cv2.line(frame, (w - 8, 8), (w - 8, 8 + bracket_len), bracket_color, bracket_thick)
+        # Bottom Left
+        cv2.line(frame, (8, h - 8), (8 + bracket_len, h - 8), bracket_color, bracket_thick)
+        cv2.line(frame, (8, h - 8), (8, h - 8 - bracket_len), bracket_color, bracket_thick)
+        # Bottom Right
+        cv2.line(frame, (w - 8, h - 8), (w - 8 - bracket_len, h - 8), bracket_color, bracket_thick)
+        cv2.line(frame, (w - 8, h - 8), (w - 8, h - 8 - bracket_len), bracket_color, bracket_thick)
+
+        # 2. Glowing target locking crosshair at the fingertip
+        if hand_seen and self.last_hands:
+            hand = self.last_hands[0]
+            lm = hand.landmarks
+            px = int(lm[8][0] * w)
+            py = int(lm[8][1] * h)
+            
+            # Glow circle
+            cv2.circle(frame, (px, py), 12, (255, 230, 100), 1, cv2.LINE_AA)
+            # Target center point
+            cv2.circle(frame, (px, py), 2, (0, 165, 255), -1, cv2.LINE_AA)  # Orange reticle point
+            
+            # Crosshair segments
+            cv2.line(frame, (px - 18, py), (px - 8, py), (255, 230, 100), 1)
+            cv2.line(frame, (px + 8, py), (px + 18, py), (255, 230, 100), 1)
+            cv2.line(frame, (px, py - 18), (px, py - 8), (255, 230, 100), 1)
+            cv2.line(frame, (px, py + 8), (px, py + 18), (255, 230, 100), 1)
+            
+            # Glowing label
+            cv2.putText(frame, "TARGET LOCK", (px + 14, py - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 165, 255), 1, cv2.LINE_AA)
+
+        # 3. Sophisticated glassmorphism status telemetry block
+        hud_x, hud_y, hud_w, hud_h = 16, 16, 440, 110
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (hud_x, hud_y), (hud_x + hud_w, hud_y + hud_h), (12, 16, 28), -1)
+        cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
+        
+        # Left neon vertical accent bar
+        cv2.rectangle(frame, (hud_x, hud_y), (hud_x + 6, hud_y + hud_h), bracket_color, -1)
+        # Grid border
+        cv2.rectangle(frame, (hud_x, hud_y), (hud_x + hud_w, hud_y + hud_h), (45, 60, 95), 1, cv2.LINE_AA)
+        
+        # Telemetry Content
+        dot_color = (80, 245, 120) if active else (100, 110, 130)
+        cv2.circle(frame, (hud_x + 24, hud_y + 24), 5, dot_color, -1, cv2.LINE_AA)
+        cv2.putText(frame, "GESTURE OS // TELEMETRY v2.5", (hud_x + 36, hud_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 200, 240), 1, cv2.LINE_AA)
+        
+        # State title
+        status_str = "ACTIVE CONTROL" if active else "SYSTEM STANDBY"
+        status_color = (255, 230, 100) if active else (150, 160, 175)
+        cv2.putText(frame, status_str, (hud_x + 20, hud_y + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.65, status_color, 2, cv2.LINE_AA)
+        
+        # Detailed stats row
+        hand_status = "LOCKED" if hand_seen else "SEARCHING..."
+        hand_color = (80, 245, 120) if hand_seen else (80, 150, 255)
+        cv2.putText(frame, f"TRACKING: {hand_status}", (hud_x + 20, hud_y + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.42, hand_color, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"GESTURE: {event.gesture.value.upper()}", (hud_x + 190, hud_y + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (240, 240, 245), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"CONF: {event.confidence:.2f}", (hud_x + 335, hud_y + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 200, 240), 1, cv2.LINE_AA)
+        
+        # Sleek upper-right FPS module
+        cv2.rectangle(frame, (hud_x + hud_w - 75, hud_y + 12), (hud_x + hud_w - 12, hud_y + 36), (20, 28, 48), -1)
+        cv2.rectangle(frame, (hud_x + hud_w - 75, hud_y + 12), (hud_x + hud_w - 12, hud_y + 36), (45, 60, 95), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"{fps:.1f} FPS", (hud_x + hud_w - 68, hud_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 220, 255), 1, cv2.LINE_AA)
+
+        # 4. Premium Holographic Volume Zone scale (Left Edge)
+        vol_w = int(w * 0.18)
+        overlay_vol = frame.copy()
+        cv2.rectangle(overlay_vol, (0, 0), (vol_w, h), (10, 15, 30), -1)
+        cv2.addWeighted(overlay_vol, 0.35, frame, 0.65, 0, frame)
+        
+        # Audio divider grid
+        cv2.line(frame, (vol_w, 0), (vol_w, h), (45, 60, 95), 1, cv2.LINE_AA)
+        cv2.line(frame, (vol_w // 2, 40), (vol_w // 2, h - 40), (45, 60, 95), 1, cv2.LINE_AA)
+        
+        # graduated ruler ticks
+        for tick in range(5):
+            y_pos = int(40 + (h - 80) * (tick / 4.0))
+            cv2.line(frame, (vol_w // 2 - 8, y_pos), (vol_w // 2 + 8, y_pos), (80, 120, 180), 1, cv2.LINE_AA)
+            pct = 100 - tick * 25
+            cv2.putText(frame, f"{pct}", (vol_w // 2 + 14, y_pos + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (120, 160, 200), 1, cv2.LINE_AA)
+            
+        # Draw dynamic slider indicator if index tip enters the volume zone
+        if hand_seen and self.last_hands:
+            lm = self.last_hands[0].landmarks
+            idx_x = lm[8][0]
+            if idx_x < 0.18:
+                idx_y = lm[8][1]
+                vol_y_px = int(idx_y * h)
+                cv2.circle(frame, (vol_w // 2, vol_y_px), 7, (0, 165, 255), -1, cv2.LINE_AA)
+                cv2.circle(frame, (vol_w // 2, vol_y_px), 11, (0, 165, 255), 1, cv2.LINE_AA)
+                cv2.putText(frame, f"VOL: {int((1.0 - idx_y) * 100)}%", (vol_w // 2 - 32, vol_y_px - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 165, 255), 1, cv2.LINE_AA)
+                
+        cv2.putText(frame, "AUDIO ZONE", (vol_w // 2 - 32, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (120, 180, 255), 1, cv2.LINE_AA)
         return frame

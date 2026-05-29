@@ -51,7 +51,7 @@ class HandTracker:
     on every frame.
     """
 
-    def __init__(self, max_hands: int = 1, min_detection_confidence: float = 0.50, min_tracking_confidence: float = 0.35):
+    def __init__(self, max_hands: int = 1, min_detection_confidence: float = 0.62, min_tracking_confidence: float = 0.60):
         try:
             from mediapipe.tasks.python.vision.hand_landmarker import HandLandmarker, HandLandmarkerOptions
             from mediapipe.tasks.python.vision.hand_landmarker import HandLandmarksConnections
@@ -147,16 +147,50 @@ class HandTracker:
         h, w = frame_bgr.shape[:2]
         for hand in hands:
             pts = [(int(p[0] * w), int(p[1] * h)) for p in hand.landmarks]
+            
+            # Premium glowing cyber connection lines (neon cyan/blue)
+            cyber_conn_color = (255, 200, 80)  # BGR neon cyan
             for conn in self._connections:
-                # Different MediaPipe versions expose either tuple-like or object-like connections.
                 start = getattr(conn, "start", conn[0] if isinstance(conn, tuple) else 0)
                 end = getattr(conn, "end", conn[1] if isinstance(conn, tuple) else 0)
                 if start < len(pts) and end < len(pts):
-                    cv2.line(frame_bgr, pts[start], pts[end], HAND_CONNECTION_COLOR, 2, cv2.LINE_AA)
+                    cv2.line(frame_bgr, pts[start], pts[end], cyber_conn_color, 2, cv2.LINE_AA)
+            
+            # Premium cyber joint styling
             for idx, (x, y) in enumerate(pts):
-                radius = 6 if idx in (4, 8, 12) else 4
-                cv2.circle(frame_bgr, (x, y), radius, HAND_LANDMARK_COLOR, -1, cv2.LINE_AA)
+                if idx in (4, 8, 12, 16, 20):  # Fingertips
+                    # Outer halo ring
+                    cv2.circle(frame_bgr, (x, y), 7, (0, 165, 255), 1, cv2.LINE_AA)  # Orange outer halo
+                    # Inner solid core
+                    cv2.circle(frame_bgr, (x, y), 3, (255, 255, 255), -1, cv2.LINE_AA)  # White inner core
+                else:
+                    # Standard joints: cyan dots
+                    cv2.circle(frame_bgr, (x, y), 4, (255, 220, 100), -1, cv2.LINE_AA)
+            
+            # Sleek corner-bracketed bounding box
             x0, y0, x1, y1 = hand.bbox
-            cv2.rectangle(frame_bgr, (x0, y0), (x1, y1), (80, 180, 255), 2, cv2.LINE_AA)
-            cv2.putText(frame_bgr, f"{hand.handedness} {hand.confidence:.2f}", (x0, max(20, y0 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (80, 180, 255), 1, cv2.LINE_AA)
+            box_color = (255, 180, 50)  # BGR Cyan-blue
+            
+            # Thin boundary box
+            cv2.rectangle(frame_bgr, (x0, y0), (x1, y1), box_color, 1, cv2.LINE_AA)
+            
+            # Thick corners
+            cl = min(15, (x1 - x0) // 5)
+            # Top-left
+            cv2.line(frame_bgr, (x0, y0), (x0 + cl, y0), box_color, 3, cv2.LINE_AA)
+            cv2.line(frame_bgr, (x0, y0), (x0, y0 + cl), box_color, 3, cv2.LINE_AA)
+            # Top-right
+            cv2.line(frame_bgr, (x1, y0), (x1 - cl, y0), box_color, 3, cv2.LINE_AA)
+            cv2.line(frame_bgr, (x1, y0), (x1, y0 + cl), box_color, 3, cv2.LINE_AA)
+            # Bottom-left
+            cv2.line(frame_bgr, (x0, y1), (x0 + cl, y1), box_color, 3, cv2.LINE_AA)
+            cv2.line(frame_bgr, (x0, y1), (x0, y1 - cl), box_color, 3, cv2.LINE_AA)
+            # Bottom-right
+            cv2.line(frame_bgr, (x1, y1), (x1 - cl, y1), box_color, 3, cv2.LINE_AA)
+            cv2.line(frame_bgr, (x1, y1), (x1, y1 - cl), box_color, 3, cv2.LINE_AA)
+            
+            # Cyber scanner label
+            label = f"{hand.handedness.upper()} ID:01 [CONF: {hand.confidence:.2f}]"
+            cv2.putText(frame_bgr, label, (x0 + 4, max(20, y0 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.40, box_color, 1, cv2.LINE_AA)
+            
         return frame_bgr
