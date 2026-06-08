@@ -19,6 +19,8 @@ class Camera:
         self.cap = cv2.VideoCapture(self.index, cv2.CAP_DSHOW if hasattr(cv2, "CAP_DSHOW") else 0)
         if not self.cap.isOpened():
             raise RuntimeError(f"Unable to open webcam index {self.index}")
+        # Force MJPG compression for high speed and high frame rates (essential on Windows/DirectShow)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self.cap.set(cv2.CAP_PROP_FPS, self.target_fps)

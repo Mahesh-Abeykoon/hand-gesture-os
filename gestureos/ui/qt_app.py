@@ -738,6 +738,7 @@ class GestureOSQtApp(QMainWindow):
         self.last_hand_seen = False
         self.fullscreen_draw = None
         self._draw_mode = False
+        self._draw_false_frames = 0
         self.recognizer = WhiteboardRecognizer()
         self._build_ui()
         self._start_worker()
@@ -1284,24 +1285,46 @@ class GestureOSQtApp(QMainWindow):
 
         # ── Drawing via InkEngine (One-Euro filter + Bézier curves) ────
         is_pinching = gesture in ("pinch", "pinch_hold", "three_finger_pinch")
-        drawing = bool(
+        raw_drawing = bool(
             self._draw_mode and hand_seen and active and
             self._dtool != "eraser_noop" and not is_pinching
         )
+        
+        # Debounce/grace period: prevent tracking dropouts and pinch flickers from breaking the drawing
+        if raw_drawing:
+            self._draw_false_frames = 0
+            drawing_state = True
+        else:
+            self._draw_false_frames += 1
+            if self._draw_false_frames <= 3:  # Bridge 3 frames of lost tracking / pinch flicker
+                drawing_state = True
+            else:
+                drawing_state = False
+
         # Whether to show cursor dot (hand visible in draw mode)
         show_cursor = bool(self._draw_mode and hand_seen and active)
 
         cursor_pt = None
-        if drawing and self._ink_engine is not None:
-            cursor_pt = self._ink_engine.update(
-                cx, cy, self._ink, tool=self._dtool,
-                t=time.perf_counter()
-            )
-        elif self._ink_engine is not None:
-            # Not drawing: lift the pen so next stroke starts fresh
-            self._ink_engine.pen_up()
+        if drawing_state:
+            # We are drawing. But only update coords if the hand is actually seen.
+            if hand_seen and self._ink_engine is not None:
+                cursor_pt = self._ink_engine.update(
+                    cx, cy, self._ink, tool=self._dtool,
+                    t=time.perf_counter()
+                )
+            elif self._ink_engine is not None and show_cursor:
+                # Hand temporarily lost during grace period: keep cursor dot stable
+                fx, fy = self._ink_engine._filter(cx, cy)
+                cursor_pt = (
+                    int(max(0, min(fw - 1, fx * fw))),
+                    int(max(0, min(fh - 1, fy * fh)))
+                )
+        else:
+            # Not drawing: lift the pen
+            if self._ink_engine is not None:
+                self._ink_engine.pen_up()
             # Still track position for cursor dot display
-            if show_cursor:
+            if show_cursor and self._ink_engine is not None:
                 fx, fy = self._ink_engine._filter(cx, cy)
                 cursor_pt = (
                     int(max(0, min(fw - 1, fx * fw))),
@@ -1320,7 +1343,7 @@ class GestureOSQtApp(QMainWindow):
 
         # ── Draw cursor dot on the blended frame ──────────────────────
         if show_cursor and cursor_pt is not None and self._ink_engine is not None:
-            self._ink_engine.draw_cursor_dot(out, cursor_pt[0], cursor_pt[1], drawing)
+            self._ink_engine.draw_cursor_dot(out, cursor_pt[0], cursor_pt[1], drawing_state)
 
 
 
@@ -1348,7 +1371,7 @@ class GestureOSQtApp(QMainWindow):
         self.conf_graph.add(confidence)
 
         if self._draw_mode:
-            if drawing:
+            if drawing_state:
                 self._dstatus.setText(f"DRAWING | {self._dtool.upper()} | {'THIN' if self._ink_pen_width <= 4 else 'THICK'}")
             elif is_pinching:
                 self._dstatus.setText("✋ PINCH = PEN LIFT")

@@ -123,7 +123,7 @@ class InkEngine:
     # Lower min_cutoff = more smoothing when still (kills jitter)
     # Higher beta = more responsive when moving fast (kills lag)
     SMOOTH_PRESET = {"min_cutoff": 0.8, "beta": 0.6, "d_cutoff": 1.0}   # Calligraphy
-    NORMAL_PRESET = {"min_cutoff": 1.2, "beta": 0.7, "d_cutoff": 1.0}   # Default
+    NORMAL_PRESET = {"min_cutoff": 1.2, "beta": 0.70, "d_cutoff": 1.0}   # Default
     FAST_PRESET   = {"min_cutoff": 2.0, "beta": 1.0, "d_cutoff": 1.0}   # Quick sketching
 
     def __init__(self, fw: int, fh: int, pen_color=(20, 24, 32), pen_width: int = 5):
