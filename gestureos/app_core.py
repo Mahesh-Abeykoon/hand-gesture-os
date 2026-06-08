@@ -219,12 +219,7 @@ class GestureEngine:
                 self.actions.mouse_up()
             return True
 
-        # Volume strip (left edge)
-        if pinching and toggles.get("volume", True) and index[0] < 0.18:
-            if self.cooldown.allow("volume"):
-                self._emit(self.actions.volume_by_position(index[1]).message)
-            self.precision_pinching = pinching
-            return True
+
 
         if toggles.get("pointer", True):
             if pinching:
@@ -353,12 +348,7 @@ class GestureEngine:
             # Whiteboard mode consumes gestures in the UI and prevents OS mouse/keyboard actions.
             return
 
-        # Volume control: intentional pinch/hold in the left control strip.
-        # This prevents normal clicks from becoming volume changes.
-        if g in (Gesture.PINCH, Gesture.PINCH_HOLD) and toggles.get("volume", True) and event.position[0] < 0.18:
-            if self.cooldown.allow("volume"):
-                self._emit(self.actions.volume_by_position(event.position[1]).message)
-            return
+
 
         # Mouse movement is continuous and should not wait for debouncing.
         if g == Gesture.INDEX_POINTER and toggles.get("pointer", True):
@@ -622,35 +612,7 @@ class GestureEngine:
         cv2.rectangle(frame, (hud_x + hud_w - 75, hud_y + 12), (hud_x + hud_w - 12, hud_y + 36), (45, 60, 95), 1, cv2.LINE_AA)
         cv2.putText(frame, f"{fps:.1f} FPS", (hud_x + hud_w - 68, hud_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 220, 255), 1, cv2.LINE_AA)
 
-        # 4. Premium Holographic Volume Zone scale (Left Edge)
-        vol_w = int(w * 0.18)
-        overlay_vol = frame.copy()
-        cv2.rectangle(overlay_vol, (0, 0), (vol_w, h), (10, 15, 30), -1)
-        cv2.addWeighted(overlay_vol, 0.35, frame, 0.65, 0, frame)
-        
-        # Audio divider grid
-        cv2.line(frame, (vol_w, 0), (vol_w, h), (45, 60, 95), 1, cv2.LINE_AA)
-        cv2.line(frame, (vol_w // 2, 40), (vol_w // 2, h - 40), (45, 60, 95), 1, cv2.LINE_AA)
-        
-        # graduated ruler ticks
-        for tick in range(5):
-            y_pos = int(40 + (h - 80) * (tick / 4.0))
-            cv2.line(frame, (vol_w // 2 - 8, y_pos), (vol_w // 2 + 8, y_pos), (80, 120, 180), 1, cv2.LINE_AA)
-            pct = 100 - tick * 25
-            cv2.putText(frame, f"{pct}", (vol_w // 2 + 14, y_pos + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (120, 160, 200), 1, cv2.LINE_AA)
-            
-        # Draw dynamic slider indicator if index tip enters the volume zone
-        if hand_seen and self.last_hands:
-            lm = self.last_hands[0].landmarks
-            idx_x = lm[8][0]
-            if idx_x < 0.18:
-                idx_y = lm[8][1]
-                vol_y_px = int(idx_y * h)
-                cv2.circle(frame, (vol_w // 2, vol_y_px), 7, (0, 165, 255), -1, cv2.LINE_AA)
-                cv2.circle(frame, (vol_w // 2, vol_y_px), 11, (0, 165, 255), 1, cv2.LINE_AA)
-                cv2.putText(frame, f"VOL: {int((1.0 - idx_y) * 100)}%", (vol_w // 2 - 32, vol_y_px - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 165, 255), 1, cv2.LINE_AA)
-                
-        cv2.putText(frame, "AUDIO ZONE", (vol_w // 2 - 32, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (120, 180, 255), 1, cv2.LINE_AA)
+
         
         # 5. Glowing alert card for bad lighting conditions
         if not hand_seen and getattr(self, "lighting_warning", None):

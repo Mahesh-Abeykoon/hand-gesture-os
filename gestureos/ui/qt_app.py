@@ -9,7 +9,7 @@ from typing import Deque, Dict, Optional
 import cv2
 import numpy as np
 
-from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QCoreApplication, QObject, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QColor, QCursor, QFont, QImage, QPainter, QPainterPath, QPen, QPixmap, QShortcut, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
@@ -579,6 +579,7 @@ class EngineWorker(QObject):
             self.running = True
             self.startedReady.emit()
             while self.running:
+                QCoreApplication.processEvents()
                 if self.paused:
                     QThread.msleep(30)
                     continue
