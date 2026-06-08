@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QColor, QCursor, QFont, QImage, QPainter, QPainterPath, QPen, QPixmap
+from PyQt6.QtGui import QColor, QCursor, QFont, QImage, QPainter, QPainterPath, QPen, QPixmap, QShortcut, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -48,6 +48,7 @@ from gestureos.gestures.types import Gesture
 from gestureos.settings.config import AppConfig
 from gestureos.utils.logging import get_logger
 from gestureos.ui.ocr_engine import AdvancedOCREngine
+from gestureos.drawing.ink_engine import InkEngine
 
 
 STYLE = """
@@ -587,7 +588,8 @@ class EngineWorker(QObject):
                 qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
                 active = self.config.gesture_mode_active or not self.config.activation_required
                 hand_seen = bool(getattr(self.engine, "last_hands", []))
-                cx, cy = getattr(self.engine, "last_cursor_pos", (0.5, 0.5))
+                # Use raw index tip for drawing (unfiltered, maps directly to camera frame)
+                cx, cy = getattr(self.engine, "last_raw_index", (0.5, 0.5))
                 dx, dy = getattr(self.engine, "last_cursor_delta", (0.0, 0.0))
                 draw_active = bool(getattr(self.engine, "last_draw_active", False))
                 self.frameReady.emit(qimg, event.gesture.value, float(event.confidence), float(fps), active, hand_seen, float(cx), float(cy), float(dx), float(dy), draw_active)
@@ -735,8 +737,42 @@ class GestureOSQtApp(QMainWindow):
         self.worker: Optional[EngineWorker] = None
         self.last_hand_seen = False
         self.fullscreen_draw = None
+        self._draw_mode = False
+        self.recognizer = WhiteboardRecognizer()
         self._build_ui()
         self._start_worker()
+        self._setup_shortcuts()
+
+    def _setup_shortcuts(self):
+        # Escape key shortcut
+        self._esc_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._esc_shortcut.activated.connect(self._handle_esc_shortcut)
+
+        # D key shortcut (case-insensitive, handles 'D' or 'd')
+        self._d_shortcut = QShortcut(QKeySequence(Qt.Key.Key_D), self)
+        self._d_shortcut.activated.connect(self._handle_d_shortcut)
+
+    def _handle_esc_shortcut(self):
+        # Escape always closes full screen draw window if visible
+        if self.fullscreen_draw is not None and self.fullscreen_draw.isVisible():
+            self.fullscreen_draw.close()
+            return
+        
+        # If in draw mode, turn it off
+        if self._draw_mode:
+            self.draw_toggle_btn.setChecked(False)
+            self._toggle_draw_mode(False)
+            return
+
+    def _handle_d_shortcut(self):
+        # Ignore if the user is typing in a text field
+        focused = self.focusWidget()
+        if focused and isinstance(focused, (QLineEdit, QTextEdit)):
+            return
+        
+        # Toggle draw mode
+        self.draw_toggle_btn.setChecked(not self._draw_mode)
+        self._toggle_draw_mode(self._draw_mode)
 
     def _build_ui(self):
         self.setStyleSheet(STYLE)
@@ -763,7 +799,14 @@ class GestureOSQtApp(QMainWindow):
         self.pause_btn = QPushButton("Pause Camera")
         self.pause_btn.setCheckable(True)
         self.pause_btn.clicked.connect(lambda v: self.pauseRequested.emit(bool(v)))
+        self.draw_toggle_btn = QPushButton("✏ Draw")
+        self.draw_toggle_btn.setObjectName("Primary")
+        self.draw_toggle_btn.setCheckable(True)
+        self.draw_toggle_btn.setChecked(False)
+        self.draw_toggle_btn.setToolTip("Toggle drawing mode (Hotkey: D)")
+        self.draw_toggle_btn.clicked.connect(self._toggle_draw_mode)
         header.addWidget(self.pause_btn)
+        header.addWidget(self.draw_toggle_btn)
         header.addWidget(self.active_btn)
         outer.addLayout(header)
 
@@ -781,7 +824,7 @@ class GestureOSQtApp(QMainWindow):
         self.video.setStyleSheet("background:#0a1128; border-radius:12px; color:#94a3b8;")
         video_layout.addWidget(self.video, 1)
 
-        # ── Draw toolbar below camera ───────────────────────────────────
+        # ── Draw toolbar below camera (hidden until Draw mode enabled) ────
         self.draw_bar_widget = QWidget()
         self.draw_bar_widget.setStyleSheet(
             "QWidget { background: #131b33; border-radius: 12px; border: 1px solid #1e2947; }"
@@ -795,11 +838,11 @@ class GestureOSQtApp(QMainWindow):
             "QPushButton#Magic:hover { background: #7c3aed; }"
             "QLabel { color: #cbd5e1; font-size: 13px; font-weight: 500; border: none; }"
         )
-        self.draw_bar_widget.hide()  # Hidden until Whiteboard tab is selected
+        self.draw_bar_widget.hide()
         draw_bar = QHBoxLayout(self.draw_bar_widget)
-        draw_bar.setContentsMargins(12, 12, 12, 12)
-        draw_bar.setSpacing(10)
-        
+        draw_bar.setContentsMargins(12, 10, 12, 10)
+        draw_bar.setSpacing(8)
+
         self._dpen = QPushButton("✏ Pen")
         self._dpen.setObjectName("Primary")
         self._dera = QPushButton("◻ Eraser")
@@ -807,19 +850,25 @@ class GestureOSQtApp(QMainWindow):
         self._dclr.setObjectName("Danger")
         self._dfix = QPushButton("✨ Auto-Fix")
         self._dfix.setObjectName("Magic")
-        self._dsave = QPushButton("💾 Save Image")
-        self._dtool = "pen"   # current draw tool for camera ink
-        
+        self._dsave = QPushButton("💾 Save")
+        self._dtool = "pen"
+        self._ink_pen_width = 6
+
         self._dpen.clicked.connect(lambda: self._set_draw_tool("pen"))
         self._dera.clicked.connect(lambda: self._set_draw_tool("eraser"))
         self._dclr.clicked.connect(self._clear_ink)
         self._dsave.clicked.connect(self._save_ink)
         self._dfix.clicked.connect(self._auto_fix_ink)
-        
-        self._dstatus = QLabel("Raise index finger to draw. Pinch to pause.")
-        
+
+        # Pen width toggle
+        self._dthick = QPushButton("── Thin")
+        self._dthick.clicked.connect(self._toggle_pen_width)
+
+        self._dstatus = QLabel("Draw mode: raise index finger")
+
         draw_bar.addWidget(self._dpen)
         draw_bar.addWidget(self._dera)
+        draw_bar.addWidget(self._dthick)
         draw_bar.addWidget(self._dfix)
         draw_bar.addWidget(self._dsave)
         draw_bar.addWidget(self._dclr)
@@ -827,13 +876,10 @@ class GestureOSQtApp(QMainWindow):
         draw_bar.addWidget(self._dstatus)
         video_layout.addWidget(self.draw_bar_widget)
 
-        # Ink buffer state (initialized on first frame)
+        # Ink buffer + professional drawing engine (initialized on first frame)
         self._ink: Optional[np.ndarray] = None
         self._ink_w = self._ink_h = 0
-        self._ink_prev: Optional[tuple] = None
-        self._ink_was_drawing = False
-        self._ink_sx = self._ink_sy = 0.5
-        self._ink_sinit = False
+        self._ink_engine: Optional[InkEngine] = None
 
         left.addWidget(self.video_card, 1)
 
@@ -851,15 +897,11 @@ class GestureOSQtApp(QMainWindow):
         self.right_tabs = QTabWidget()
         self.right_tabs.setMinimumWidth(410)
         main.addWidget(self.right_tabs, 1)
-        self.right_tabs.addTab(self._whiteboard_tab(), "Whiteboard")
-        self.whiteboard_tab_widget = self.right_tabs.widget(0)
         self.right_tabs.addTab(self._controls_tab(), "Control")
         self.right_tabs.addTab(self._gestures_tab(), "Gestures")
         self.right_tabs.addTab(self._instructions_tab(), "Instructions")
         self.right_tabs.addTab(self._diagnostics_tab(), "Diagnostics")
         self.right_tabs.addTab(self._trainer_tab(), "Trainer")
-        self.right_tabs.currentChanged.connect(self._tab_changed)
-        self._tab_changed(0)
 
     def _controls_tab(self) -> QWidget:
         tab = QWidget(); layout = QVBoxLayout(tab)
@@ -946,32 +988,29 @@ class GestureOSQtApp(QMainWindow):
         text = QTextEdit()
         text.setReadOnly(True)
         text.setText(
-            "NORMAL DESKTOP MODE\n"
+            "DESKTOP CONTROL MODE (default)\n"
             "• Open palm activates GestureOS.\n"
             "• Index finger moves the desktop cursor.\n"
-            "• Thumb + index quick touch/release = click.\n"
+            "• Thumb + index quick pinch/release = click.\n"
             "• Thumb + index hold + move = drag.\n"
-            "• Three-finger pinch = right click.\n\n"
-            "DRAWING / WHITEBOARD MODE\n"
-            "• Open the Whiteboard tab or Full Screen Draw.\n"
-            "• Desktop cursor and desktop actions are locked.\n"
-            "• NO PINCH is required for drawing.\n"
-            "• Your index fingertip is the pen. Keep the index finger visible.\n"
-            "• Move the index finger to write on the board.\n"
-            "• Use Hover / Pause to move without drawing.\n"
-            "• Use Eraser to erase with the same index movement.\n"
-            "• The pen cursor is hidden so it does not disturb the drawing.\n"
-            "• Full Screen Draw includes a right-side live camera preview and tools.\n\n"
-            "WHY DRAW MODE DOES NOT USE PINCH\n"
-            "Pinch makes thumb and index landmarks dance/occlude each other, which creates false strokes. "
-            "For smooth handwriting, GestureOS uses index-only drawing in draw mode. Pinch is only for clicking in desktop mode.\n\n"
+            "• Three-finger pinch = right click.\n"
+            "• Fist = play/pause media.\n"
+            "• Thumb up = mute toggle.\n"
+            "• Swipe left/right = previous/next.\n\n"
+            "DRAW MODE (✏ Draw button)\n"
+            "• Index fingertip draws directly on the camera.\n"
+            "• Pinch thumb+index = lift pen (separate strokes).\n"
+            "• Toolbar: Pen, Eraser, Clear, Save, Auto-Fix.\n"
+            "• OS cursor is hidden during drawing.\n\n"
+            "CUSTOM GESTURES\n"
+            "• Go to Gestures tab to map gestures to shortcuts.\n"
+            "• Use 'hotkey:ctrl+tab' or 'press:space' format.\n"
+            "• Go to Trainer tab to teach custom hand poses.\n\n"
             "BEST RESULTS\n"
-            "• Use 640x480 or 960x540 at 60 FPS.\n"
             "• Use strong front lighting.\n"
             "• Keep hand 45–75 cm from webcam.\n"
-            "• Keep index finger clearly visible.\n"
-            "• Write slowly like on a real board.\n"
-            "• Use Full Screen Draw for teaching/presentations."
+            "• Avoid busy/dark backgrounds.\n"
+            "• Keep fingers clearly visible.\n"
         )
         layout.addWidget(text, 1)
         return tab
@@ -1063,15 +1102,56 @@ class GestureOSQtApp(QMainWindow):
         self.stopRequested.connect(self.worker.stop)
         self.thread.start()
 
+    def _toggle_draw_mode(self, checked: bool):
+        """Toggle draw mode on/off from the header button."""
+        self._draw_mode = bool(checked)
+        self.draw_bar_widget.setVisible(self._draw_mode)
+        if self._draw_mode:
+            self.draw_toggle_btn.setText("✏ Drawing ON")
+            self.draw_toggle_btn.setStyleSheet("background:#7c3aed; color:white; border:none; border-radius:10px; padding:9px 12px; font-weight:700;")
+            self.config_data.gesture_mode_active = True
+            self.setActiveRequested.emit(True)
+            self.whiteboardModeRequested.emit(True)
+            self.video.setCursor(QCursor(Qt.CursorShape.BlankCursor))
+            if self._ink_engine:
+                self._ink_engine.reset()
+            self._log("Draw mode ON — index finger draws, pinch lifts pen. Press D or ESC to exit.")
+        else:
+            self.draw_toggle_btn.setText("✏ Draw")
+            self.draw_toggle_btn.setStyleSheet("")
+            self.whiteboardModeRequested.emit(False)
+            self.video.unsetCursor()
+            try:
+                QApplication.restoreOverrideCursor()
+            except Exception:
+                pass
+            if self._ink_engine:
+                self._ink_engine.pen_up()
+            self._log("Draw mode OFF — OS cursor control resumed")
+
+
+
+    def _toggle_pen_width(self):
+        if self._ink_pen_width <= 4:
+            self._ink_pen_width = 10
+            self._dthick.setText("━━ Thick")
+        else:
+            self._ink_pen_width = 4
+            self._dthick.setText("── Thin")
+        if self._ink_engine:
+            self._ink_engine.pen_width = self._ink_pen_width
+
     def _set_draw_tool(self, t: str):
         self._dtool = t
-        self._ink_prev = None
+        if self._ink_engine:
+            self._ink_engine.pen_up()
         self._dstatus.setText(f"Tool: {t.upper()}")
 
     def _clear_ink(self):
         if self._ink is not None:
             self._ink[:] = 255
-        self._ink_prev = None
+        if self._ink_engine:
+            self._ink_engine.reset()
         self._dstatus.setText("Cleared")
 
     def _save_ink(self):
@@ -1095,7 +1175,7 @@ class GestureOSQtApp(QMainWindow):
         
         # 1. Try to recognize text (digits/letters)
         best, _ = self.recognizer.recognize(binary)
-        if best and best.confidence > 0.5 and len(best.text) > 0:
+        if best and best.confidence > 0.5 and len(best.text) > 0 and best.text != "?":
             self._ink[:] = 255
             font = cv2.FONT_HERSHEY_SIMPLEX
             fs = max(1.0, h / 30.0)
@@ -1112,22 +1192,72 @@ class GestureOSQtApp(QMainWindow):
         if contours:
             c = max(contours, key=cv2.contourArea)
             area = cv2.contourArea(c)
-            if area > 100:
-                peri = cv2.arcLength(c, True)
-                approx = cv2.approxPolyDP(c, 0.04 * peri, True)
-                if len(approx) == 4:
-                    self._ink[:] = 255
-                    cv2.drawContours(self._ink, [approx], -1, (20, 24, 32), max(3, int(w/50)))
-                    self._log("Auto-fixed to Rectangle")
-                    self._dstatus.setText("Fixed to Rectangle")
-                else:
-                    (cx, cy), radius = cv2.minEnclosingCircle(c)
-                    circle_area = np.pi * (radius**2)
-                    if circle_area > 0 and area / circle_area > 0.70:
+            
+            # Check for line/elongated straight stroke first
+            # 1. Must be elongated (high aspect ratio)
+            # 2. Must fit a straight line well (low mean distance of points to the line)
+            rect = cv2.minAreaRect(c)
+            (cx, cy), (rw, rh), angle = rect
+            if min(rw, rh) > 0:
+                aspect_ratio = max(rw, rh) / min(rw, rh)
+                if aspect_ratio > 4.5 and max(rw, rh) > 30:
+                    line_params = cv2.fitLine(c, cv2.DIST_L2, 0, 0.01, 0.01)
+                    vx, vy, x0, y0 = [float(val) for val in line_params.flatten()]
+                    pts_flat = c.reshape(-1, 2)
+                    dx = pts_flat[:, 0] - x0
+                    dy = pts_flat[:, 1] - y0
+                    # Distance of contour points to the fitted line
+                    distances = np.abs(dx * vy - dy * vx)
+                    mean_dist = np.mean(distances)
+                    
+                    if mean_dist < 3.5:  # Confirmed straight line
+                        t = dx * vx + dy * vy
+                        t_min, t_max = np.min(t), np.max(t)
+                        p1 = (int(round(x0 + t_min * vx)), int(round(y0 + t_min * vy)))
+                        p2 = (int(round(x0 + t_max * vx)), int(round(y0 + t_max * vy)))
+                        
                         self._ink[:] = 255
-                        cv2.circle(self._ink, (int(cx), int(cy)), int(radius), (20, 24, 32), max(3, int(w/50)), cv2.LINE_AA)
-                        self._log("Auto-fixed to Circle")
-                        self._dstatus.setText("Fixed to Circle")
+                        cv2.line(self._ink, p1, p2, (20, 24, 32), max(3, int(w/50)), cv2.LINE_AA)
+                        self._log("Auto-fixed to Line")
+                        self._dstatus.setText("Fixed to Line")
+                        return
+
+            # For closed shapes (Rectangle, Triangle, Circle), the contour must enclose a substantial
+            # area relative to its bounding box (meaning the shape is closed, not a thin open scribble)
+            bbox_area = w * h
+            if area > 100 and bbox_area > 0:
+                fill_ratio = area / bbox_area
+                
+                if fill_ratio > 0.25:  # Must be a closed-loop shape
+                    peri = cv2.arcLength(c, True)
+                    approx = cv2.approxPolyDP(c, 0.04 * peri, True)
+                    if len(approx) == 4:
+                        self._ink[:] = 255
+                        cv2.drawContours(self._ink, [approx], -1, (20, 24, 32), max(3, int(w/50)), lineType=cv2.LINE_AA)
+                        self._log("Auto-fixed to Rectangle")
+                        self._dstatus.setText("Fixed to Rectangle")
+                        return
+                    elif len(approx) == 3:
+                        self._ink[:] = 255
+                        cv2.drawContours(self._ink, [approx], -1, (20, 24, 32), max(3, int(w/50)), lineType=cv2.LINE_AA)
+                        self._log("Auto-fixed to Triangle")
+                        self._dstatus.setText("Fixed to Triangle")
+                        return
+                    else:
+                        (cx, cy), radius = cv2.minEnclosingCircle(c)
+                        circle_area = np.pi * (radius**2)
+                        if circle_area > 0 and area / circle_area > 0.65:
+                            self._ink[:] = 255
+                            cv2.circle(self._ink, (int(cx), int(cy)), int(radius), (20, 24, 32), max(3, int(w/50)), cv2.LINE_AA)
+                            self._log("Auto-fixed to Circle")
+                            self._dstatus.setText("Fixed to Circle")
+                            return
+
+        self._log("Auto-fix: No clear text or shape detected")
+        self._dstatus.setText("No shape/text matched")
+
+        self._log("Auto-fix: No clear text or shape detected")
+        self._dstatus.setText("No shape/text matched")
 
     @pyqtSlot(QImage, str, float, float, bool, bool, float, float, float, float, bool)
     def _on_frame(self, img: QImage, gesture: str, confidence: float, fps: float,
@@ -1143,58 +1273,57 @@ class GestureOSQtApp(QMainWindow):
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
         fh, fw = frame_bgr.shape[:2]
 
-        # ── Init / resize ink buffer ────────────────────────────────────
+        # ── Init / resize ink buffer & engine ───────────────────────────
         if self._ink is None or self._ink_w != fw or self._ink_h != fh:
             self._ink = np.full((fh, fw, 3), 255, dtype=np.uint8)
             self._ink_w, self._ink_h = fw, fh
-            self._ink_prev = None
+            self._ink_engine = InkEngine(fw, fh, pen_width=self._ink_pen_width)
+        elif self._ink_engine is not None:
+            self._ink_engine.resize(fw, fh)
+            self._ink_engine.pen_width = self._ink_pen_width
 
-        is_whiteboard_tab = (hasattr(self, "whiteboard_tab_widget") and self.right_tabs.currentWidget() is self.whiteboard_tab_widget)
-        
-        # ── Draw into ink buffer when hand is seen & active ───────────────
-        drawing = bool(hand_seen and active and self._dtool != "eraser_noop" and is_whiteboard_tab and gesture != "pinch")
-        if drawing:
-            # EMA smooth (reject teleports > 20% of frame)
-            if not self._ink_sinit:
-                self._ink_sx, self._ink_sy = cx, cy
-                self._ink_sinit = True
-            else:
-                dist_px = math.hypot(cx - self._ink_sx, cy - self._ink_sy)
-                if dist_px < 0.20:
-                    a = 0.55
-                    self._ink_sx += a * (cx - self._ink_sx)
-                    self._ink_sy += a * (cy - self._ink_sy)
+        # ── Drawing via InkEngine (One-Euro filter + Bézier curves) ────
+        is_pinching = gesture in ("pinch", "pinch_hold", "three_finger_pinch")
+        drawing = bool(
+            self._draw_mode and hand_seen and active and
+            self._dtool != "eraser_noop" and not is_pinching
+        )
+        # Whether to show cursor dot (hand visible in draw mode)
+        show_cursor = bool(self._draw_mode and hand_seen and active)
 
-            px = int(max(0, min(fw - 1, self._ink_sx * fw)))
-            py = int(max(0, min(fh - 1, self._ink_sy * fh)))
-            cur = (px, py)
+        cursor_pt = None
+        if drawing and self._ink_engine is not None:
+            cursor_pt = self._ink_engine.update(
+                cx, cy, self._ink, tool=self._dtool,
+                t=time.perf_counter()
+            )
+        elif self._ink_engine is not None:
+            # Not drawing: lift the pen so next stroke starts fresh
+            self._ink_engine.pen_up()
+            # Still track position for cursor dot display
+            if show_cursor:
+                fx, fy = self._ink_engine._filter(cx, cy)
+                cursor_pt = (
+                    int(max(0, min(fw - 1, fx * fw))),
+                    int(max(0, min(fh - 1, fy * fh)))
+                )
 
-            if self._dtool == "eraser":
-                cv2.circle(self._ink, cur, 20, (255, 255, 255), -1, cv2.LINE_AA)
-            else:
-                # PEN: connect prev → cur every frame (never broken)
-                if not self._ink_was_drawing or self._ink_prev is None:
-                    cv2.circle(self._ink, cur, 3, (20, 24, 32), -1, cv2.LINE_AA)
-                else:
-                    cv2.line(self._ink, self._ink_prev, cur, (20, 24, 32), 5, cv2.LINE_AA)
-            self._ink_prev = cur
-        else:
-            self._ink_sinit = False
-            self._ink_prev = None
-        self._ink_was_drawing = bool(hand_seen and active)
-
-        # ── Blend ink over camera frame ────────────────────────────────
-        mask = False
-        if is_whiteboard_tab:
-            mask = np.any(self._ink < 245, axis=2)
-            
+        # ── Blend ink onto camera frame ────────────────────────────────
         out = frame_bgr.copy()
-        if is_whiteboard_tab and mask.any():
-            out[mask] = (
-                frame_bgr[mask].astype(np.float32) * 0.15
-                + self._ink[mask].astype(np.float32) * 0.85
-            ).astype(np.uint8)
-            
+        if self._draw_mode and self._ink is not None:
+            mask = np.any(self._ink < 245, axis=2)
+            if mask.any():
+                out[mask] = (
+                    frame_bgr[mask].astype(np.float32) * 0.08
+                    + self._ink[mask].astype(np.float32) * 0.92
+                ).astype(np.uint8)
+
+        # ── Draw cursor dot on the blended frame ──────────────────────
+        if show_cursor and cursor_pt is not None and self._ink_engine is not None:
+            self._ink_engine.draw_cursor_dot(out, cursor_pt[0], cursor_pt[1], drawing)
+
+
+
         out_rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
         h, w, ch = out_rgb.shape
         display_img = QImage(out_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
@@ -1206,19 +1335,8 @@ class GestureOSQtApp(QMainWindow):
             Qt.TransformationMode.SmoothTransformation,
         )
         self.video.setPixmap(pix)
-        
-        # ── Display clean drawing preview on the right tab if active ──
-        if is_whiteboard_tab:
-            ink_rgb = cv2.cvtColor(self._ink, cv2.COLOR_BGR2RGB)
-            ink_img = QImage(ink_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
-            pix_ink = QPixmap.fromImage(ink_img).scaled(
-                self.whiteboard_preview.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            self.whiteboard_preview.setPixmap(pix_ink)
 
-        # ── Metrics & other panels ──────────────────────────────────
+        # ── Metrics & status panels ─────────────────────────────────
         self.fps_card.set_value(f"{fps:.1f}")
         self.gesture_card.set_value(gesture)
         self.conf_card.set_value(f"{confidence:.2f}")
@@ -1228,8 +1346,17 @@ class GestureOSQtApp(QMainWindow):
         self.active_btn.setText("Active" if active else "Activate")
         self.fps_graph.add(fps)
         self.conf_graph.add(confidence)
-        state = "DRAWING" if (hand_seen and active) else "HOVER"
-        self._dstatus.setText(f"{state} | {self._dtool.upper()}")
+
+        if self._draw_mode:
+            if drawing:
+                self._dstatus.setText(f"DRAWING | {self._dtool.upper()} | {'THIN' if self._ink_pen_width <= 4 else 'THICK'}")
+            elif is_pinching:
+                self._dstatus.setText("✋ PINCH = PEN LIFT")
+            elif hand_seen:
+                self._dstatus.setText("PEN HOVERING — move index finger")
+            else:
+                self._dstatus.setText("Show hand to draw")
+
         if getattr(self, "fullscreen_draw", None) is not None and self.fullscreen_draw.isVisible():
             self.fullscreen_draw.update_camera(img)
             self.fullscreen_draw.update_from_absolute(cx, cy, hand_seen and active)
@@ -1238,23 +1365,10 @@ class GestureOSQtApp(QMainWindow):
             self.last_hand_seen = hand_seen
 
 
-    def _tab_changed(self, index: int):
-        enabled = hasattr(self, "whiteboard_tab_widget") and self.right_tabs.currentWidget() is self.whiteboard_tab_widget
-        if hasattr(self, "draw_bar_widget"):
-            self.draw_bar_widget.setVisible(enabled)
-        
-        if enabled:
-            self.config_data.gesture_mode_active = True
-            self.setActiveRequested.emit(True)
-            self._log("Whiteboard mode: OS actions paused; gestures draw on camera screen")
-            
-        self.whiteboardModeRequested.emit(bool(enabled))
-
-
     def _open_fullscreen_draw(self):
         self.fullscreen_draw = FullScreenDrawWindow(self)
         self.fullscreen_draw.closed.connect(self._fullscreen_closed)
-        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.BlankCursor))
+        self.fullscreen_draw.camera_view.setCursor(QCursor(Qt.CursorShape.BlankCursor))
         self.config_data.gesture_mode_active = True
         self.setActiveRequested.emit(True)
         self.whiteboardModeRequested.emit(True)
@@ -1262,14 +1376,15 @@ class GestureOSQtApp(QMainWindow):
         self.fullscreen_draw.showFullScreen()
 
     def _fullscreen_closed(self):
-        # Keep whiteboard mode if the normal Whiteboard tab is still active; otherwise unlock desktop actions.
         try:
             QApplication.restoreOverrideCursor()
         except Exception:
             pass
-        enabled = hasattr(self, "whiteboard_tab_widget") and self.right_tabs.currentWidget() is self.whiteboard_tab_widget
-        self.whiteboardModeRequested.emit(bool(enabled))
+        # Keep whiteboard signal in sync with draw mode toggle
+        self.whiteboardModeRequested.emit(bool(self._draw_mode))
         self._log("Full screen draw closed")
+
+
 
     def _toggle_active(self, checked: bool):
         self.config_data.gesture_mode_active = bool(checked)

@@ -97,19 +97,33 @@ class CursorMapper:
         self.last_raw_relative: Optional[Tuple[float, float]] = None
         self.warmup_frames = 0
 
-    def update_settings(self, smoothing: float) -> None:
+    def update_settings(self, smoothing: float, sensitivity: float) -> None:
         smoothing = clamp(smoothing, 0.05, 0.95)
-        self.settings.min_cutoff = 2.4 - 1.75 * smoothing
-        self.settings.beta = 0.055 - 0.042 * smoothing
-        self.settings.relative_deadzone = 0.0014 * smoothing + 0.00055
-        # Conservative gain reduces wrong jumps. User can lower smoothing for speed.
-        self.settings.relative_gain = 2.95 - 1.05 * smoothing
-        self.settings.max_step = 0.036 - 0.018 * smoothing
+        sensitivity = clamp(sensitivity, 0.05, 0.95)
+        
+        # Lower smoothing means higher min_cutoff (more direct, less lag)
+        self.settings.min_cutoff = 2.8 - 2.15 * smoothing
+        self.settings.beta = 0.065 - 0.050 * smoothing
+        
+        # Deadzone: lower sensitivity means higher deadzone.
+        # But even at high sensitivity, keep deadzone small to avoid jitter, yet allow micro-movement.
+        self.settings.relative_deadzone = max(0.0003, 0.0016 - 0.00135 * sensitivity)
+        
+        # relative_gain: base gain scales dramatically with sensitivity!
+        # When sensitivity is high, let's make it super responsive (e.g. up to 7.5x gain)!
+        # At default sensitivity ~0.72, relative_gain is around 6.1.
+        self.settings.relative_gain = 1.2 + 6.8 * sensitivity
+        
+        # max_step: increase max_step to allow fast flick pointer movements without clamping!
+        # If sensitivity is high, max_step should be large (e.g. 0.08 - 0.10).
+        self.settings.max_step = 0.03 + 0.07 * sensitivity
         self.settings.raw_jump_limit = 0.075 - 0.030 * smoothing
+        
+        # Adjust OneEuroFilter parameters accordingly
         self.fx.min_cutoff = self.fy.min_cutoff = self.settings.min_cutoff
         self.fx.beta = self.fy.beta = self.settings.beta
-        self.rfx.min_cutoff = self.rfy.min_cutoff = 2.35 - 1.25 * smoothing
-        self.rfx.beta = self.rfy.beta = 0.050 - 0.035 * smoothing
+        self.rfx.min_cutoff = self.rfy.min_cutoff = 2.75 - 1.65 * smoothing
+        self.rfx.beta = self.rfy.beta = 0.060 - 0.045 * smoothing
 
     def reset(self) -> None:
         self.fx.reset()

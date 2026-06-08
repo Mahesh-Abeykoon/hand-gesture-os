@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Callable, List, Optional, Tuple
 
 import cv2
+import numpy as np
+import math
 
 from gestureos.actions.controller import ActionController
 from gestureos.gestures.recognizer import GestureRecognizer
@@ -37,7 +39,7 @@ class GestureEngine:
         self.cooldown = CooldownGate(config.cooldowns)
         self.actions = ActionController(config)
         self.cursor = CursorMapper()
-        self.cursor.update_settings(config.cursor_smoothing)
+        self.cursor.update_settings(config.cursor_smoothing, config.sensitivity)
         self.trainer = GestureTrainer(config.profiles_path)
         self.history: List[str] = []
         self.last_event = GestureEvent(Gesture.NONE, 0.0)
@@ -45,6 +47,7 @@ class GestureEngine:
         self.last_cursor_pos = (0.5, 0.5)
         self.last_cursor_delta = (0.0, 0.0)
         self.last_draw_active = False
+        self.last_raw_index = (0.5, 0.5)  # Raw unfiltered index tip for drawing
         self.precision_pinching = False
         self.precision_pinch_started = 0.0
         self.precision_last_release = 0.0
@@ -59,6 +62,9 @@ class GestureEngine:
         self.pre_pinching = False
         self.pre_pinch_frozen_os_pos = None
         self.optical_pointer = OpticalFlowPointTracker(max_age=0.40)
+        self.lighting_warning = None
+        self.lighting_warning_short = ""
+        self.last_lighting_check = 0.0
 
     def close(self) -> None:
         self.camera.release()
@@ -67,12 +73,14 @@ class GestureEngine:
         self.history.append(message)
         self.history[:] = self.history[-200:]
         self.on_log(message)
-        self.log.info(message)
+        # Safely clean non-ASCII/emojis for the file/console logger to prevent CP1252 errors on Windows
+        clean_msg = message.encode("ascii", errors="replace").decode("ascii")
+        self.log.info(clean_msg)
 
     def update_config(self) -> None:
         self.recognizer.set_sensitivity(self.config.sensitivity)
         self.debouncer.update_threshold(self.config.confidence_threshold)
-        self.cursor.update_settings(self.config.cursor_smoothing)
+        self.cursor.update_settings(self.config.cursor_smoothing, self.config.sensitivity)
 
     def _active_gate(self, event: GestureEvent) -> bool:
         if not self.config.activation_required:
@@ -398,10 +406,62 @@ class GestureEngine:
         elif g == Gesture.TWO_FINGER_SCROLL and toggles.get("scroll", True) and self.cooldown.allow("scroll"):
             self.actions.scroll(event.value)
 
+    def _check_lighting(self, frame: np.ndarray) -> None:
+        """Run periodic check to diagnose low-light or backlit scenes."""
+        now = time.perf_counter()
+        if now - self.last_lighting_check < 1.0:  # Run once per second
+            return
+        self.last_lighting_check = now
+
+        # Convert to grayscale to check brightness
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        mean_brightness = gray.mean()
+
+        prev_warning = self.lighting_warning
+        new_warning = None
+        new_short = ""
+
+        if mean_brightness < 20.0:
+            new_warning = "Webcam too dark. Turn on a lamp/light."
+            new_short = "TOO DARK"
+        else:
+            # Check for extreme backlight (e.g. bright light source in one quadrant, rest is dark)
+            q_w, q_h = w // 2, h // 2
+            quadrants = [
+                gray[0:q_h, 0:q_w],     # Top-Left
+                gray[0:q_h, q_w:w],     # Top-Right
+                gray[q_h:h, 0:q_w],     # Bot-Left
+                gray[q_h:h, q_w:w]      # Bot-Right
+            ]
+            q_means = [float(q.mean()) for q in quadrants]
+            max_q = max(q_means)
+            min_q = min(q_means)
+
+            if max_q > 80.0 and min_q < 12.0:
+                new_warning = "Webcam is backlit. Move away from window/light."
+                new_short = "BACKLIT"
+            elif mean_brightness < 32.0:
+                new_warning = "Low lighting. Add front-facing light."
+                new_short = "LOW LIGHT"
+
+        self.lighting_warning = new_warning
+        self.lighting_warning_short = new_short
+
+        if new_warning != prev_warning:
+            if new_warning:
+                self._emit(f"⚠️ LIGHTING ALERT: {new_warning}")
+            else:
+                self._emit("✨ Lighting conditions resolved")
+
     def step(self) -> Tuple[object, Optional[GestureEvent], float]:
         ok, frame, dt = self.camera.read()
         if not ok or frame is None:
             raise RuntimeError("Camera frame unavailable")
+        
+        # Check lighting on raw frame before enhancement
+        self._check_lighting(frame)
+        
         if self.config.low_light_enhancement:
             frame = self._enhance_low_light(frame)
         hands = self.tracker.process(frame)
@@ -409,6 +469,9 @@ class GestureEngine:
         event = GestureEvent(Gesture.NONE, 0.0)
         if hands:
             event = self.recognizer.recognize(hands[0])
+            # Track raw index tip for drawing (before any cursor filter)
+            lm = hands[0].landmarks
+            self.last_raw_index = (float(lm[8][0]), float(lm[8][1]))
             custom = self.trainer.predict(hands[0].landmarks)
             if custom and not getattr(self.config, "whiteboard_mode", False) and self.cooldown.allow(custom.name):
                 self._emit(self.actions.execute_custom(custom.action).message)
@@ -433,11 +496,50 @@ class GestureEngine:
         return frame, event, self.camera.fps
 
     def _enhance_low_light(self, frame):
-        # CLAHE on luminance gives better landmark stability in dim rooms.
+        """Adaptive low-light enhancement with denoising for hand detection.
+        
+        Pipeline: Denoise → Gamma brighten → CLAHE contrast.
+        Denoising MUST come first to prevent gamma from amplifying sensor noise.
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        mean_brightness = gray.mean()
+        
+        # Reasonably bright — mild CLAHE only (fast path)
+        if mean_brightness > 80:
+            ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+            y, cr, cb = cv2.split(ycrcb)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            y = clahe.apply(y)
+            return cv2.cvtColor(cv2.merge((y, cr, cb)), cv2.COLOR_YCrCb2BGR)
+        
+        # --- Dark frame: full enhancement pipeline ---
+        
+        # Stage 1: Denoise BEFORE brightening to prevent noise amplification.
+        # Bilateral filter preserves edges (hand contours) while smoothing noise.
+        frame = cv2.bilateralFilter(frame, d=7, sigmaColor=45, sigmaSpace=45)
+        
+        # Stage 2: Gamma correction to lift dark pixels
+        if mean_brightness < 20:
+            gamma = 0.30
+        elif mean_brightness < 35:
+            gamma = 0.40
+        elif mean_brightness < 50:
+            gamma = 0.50
+        else:
+            gamma = 0.60
+        
+        table = np.array([
+            ((i / 255.0) ** gamma) * 255 for i in range(256)
+        ], dtype=np.uint8)
+        frame = cv2.LUT(frame, table)
+        
+        # Stage 3: CLAHE for local contrast to make hand features pop
         ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
         y, cr, cb = cv2.split(ycrcb)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clip = 3.5 if mean_brightness < 30 else 2.5
+        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8))
         y = clahe.apply(y)
+        
         return cv2.cvtColor(cv2.merge((y, cr, cb)), cv2.COLOR_YCrCb2BGR)
 
     def _draw_hud(self, frame, event: GestureEvent, fps: float, hand_seen: bool):
@@ -504,8 +606,13 @@ class GestureEngine:
         cv2.putText(frame, status_str, (hud_x + 20, hud_y + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.65, status_color, 2, cv2.LINE_AA)
         
         # Detailed stats row
-        hand_status = "LOCKED" if hand_seen else "SEARCHING..."
-        hand_color = (80, 245, 120) if hand_seen else (80, 150, 255)
+        warning_str = getattr(self, "lighting_warning_short", "")
+        if warning_str and not hand_seen:
+            hand_status = f"POOR LIGHT ({warning_str})"
+            hand_color = (60, 100, 255)  # Amber warning color
+        else:
+            hand_status = "LOCKED" if hand_seen else "SEARCHING..."
+            hand_color = (80, 245, 120) if hand_seen else (80, 150, 255)
         cv2.putText(frame, f"TRACKING: {hand_status}", (hud_x + 20, hud_y + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.42, hand_color, 1, cv2.LINE_AA)
         cv2.putText(frame, f"GESTURE: {event.gesture.value.upper()}", (hud_x + 190, hud_y + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (240, 240, 245), 1, cv2.LINE_AA)
         cv2.putText(frame, f"CONF: {event.confidence:.2f}", (hud_x + 335, hud_y + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 200, 240), 1, cv2.LINE_AA)
@@ -544,4 +651,28 @@ class GestureEngine:
                 cv2.putText(frame, f"VOL: {int((1.0 - idx_y) * 100)}%", (vol_w // 2 - 32, vol_y_px - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 165, 255), 1, cv2.LINE_AA)
                 
         cv2.putText(frame, "AUDIO ZONE", (vol_w // 2 - 32, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (120, 180, 255), 1, cv2.LINE_AA)
+        
+        # 5. Glowing alert card for bad lighting conditions
+        if not hand_seen and getattr(self, "lighting_warning", None):
+            card_x, card_y, card_w, card_h = w - 300, h - 136, 284, 120
+            card_overlay = frame.copy()
+            cv2.rectangle(card_overlay, (card_x, card_y), (card_x + card_w, card_y + card_h), (12, 18, 32), -1)
+            cv2.addWeighted(card_overlay, 0.8, frame, 0.2, 0, frame)
+            
+            pulse = int(140 + 80 * math.sin(time.perf_counter() * 5))
+            cv2.rectangle(frame, (card_x, card_y), (card_x + card_w, card_y + card_h), (0, pulse, pulse + 20), 1, cv2.LINE_AA)
+            cv2.rectangle(frame, (card_x, card_y), (card_x + 8, card_y + card_h), (0, pulse - 30, pulse + 10), -1)
+            
+            cv2.putText(frame, "LIGHTING ALERT", (card_x + 18, card_y + 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, pulse, pulse + 20), 2, cv2.LINE_AA)
+            
+            lines = [
+                "Camera feed is too dark or",
+                "backlit. Please:",
+                "1. Turn on a desk lamp/light",
+                "2. Reposition webcam from window"
+            ]
+            for idx, line in enumerate(lines):
+                cv2.putText(frame, line, (card_x + 18, card_y + 46 + idx * 16),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 200, 240), 1, cv2.LINE_AA)
         return frame
