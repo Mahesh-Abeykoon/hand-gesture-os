@@ -33,6 +33,7 @@ class ActionController:
         self.last_volume_anchor: Optional[float] = None
         self._rel_x_accum = 0.0
         self._rel_y_accum = 0.0
+        self.on_action: Optional[Callable[[str, dict], None]] = None
 
     def _hotkey(self, *keys: str) -> None:
         if pyautogui:
@@ -86,6 +87,8 @@ class ActionController:
         if pyautogui:
             pyautogui.click(button="left")
             beep(self.config.sound_feedback)
+            if self.on_action:
+                self.on_action("click", {"button": "left"})
             return ActionResult(True, "Left click")
         return ActionResult(False, "PyAutoGUI unavailable")
 
@@ -93,6 +96,8 @@ class ActionController:
         if pyautogui:
             pyautogui.doubleClick()
             beep(self.config.sound_feedback)
+            if self.on_action:
+                self.on_action("click", {"button": "double"})
             return ActionResult(True, "Double click")
         return ActionResult(False, "PyAutoGUI unavailable")
 
@@ -100,6 +105,8 @@ class ActionController:
         if pyautogui:
             pyautogui.click(button="right")
             beep(self.config.sound_feedback)
+            if self.on_action:
+                self.on_action("click", {"button": "right"})
             return ActionResult(True, "Right click")
         return ActionResult(False, "PyAutoGUI unavailable")
 
@@ -177,6 +184,8 @@ class ActionController:
         if not self.volume.set_volume_scalar(scalar):
             # Fallback to keyboard volume buttons for non-Windows.
             self._press("volumeup" if scalar > 0.5 else "volumedown")
+        if self.on_action:
+            self.on_action("volume", {"value": int(scalar * 100)})
         return ActionResult(True, f"Volume {int(scalar * 100)}%")
 
     def execute_custom(self, action: str) -> ActionResult:

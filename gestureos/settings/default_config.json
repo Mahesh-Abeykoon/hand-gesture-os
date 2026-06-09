@@ -13,6 +13,7 @@
   "sound_feedback": true,
   "dark_mode": true,
   "show_skeleton": true,
+  "desktop_hud_enabled": true,
   "multi_monitor": true,
   "cooldowns": {
     "play_pause": 0.8,

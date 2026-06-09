@@ -119,12 +119,9 @@ class InkEngine:
       - Proper pen-up / pen-down state machine
     """
 
-    # Tuning presets for One-Euro filter
-    # Lower min_cutoff = more smoothing when still (kills jitter)
-    # Higher beta = more responsive when moving fast (kills lag)
-    SMOOTH_PRESET = {"min_cutoff": 0.8, "beta": 0.6, "d_cutoff": 1.0}   # Calligraphy
-    NORMAL_PRESET = {"min_cutoff": 1.2, "beta": 0.70, "d_cutoff": 1.0}   # Default
-    FAST_PRESET   = {"min_cutoff": 2.0, "beta": 1.0, "d_cutoff": 1.0}   # Quick sketching
+    SMOOTH_PRESET = {"min_cutoff": 0.6, "beta": 0.5, "d_cutoff": 1.0}
+    NORMAL_PRESET = {"min_cutoff": 0.9, "beta": 0.55, "d_cutoff": 1.0}
+    FAST_PRESET   = {"min_cutoff": 1.5, "beta": 0.8, "d_cutoff": 1.0}
 
     def __init__(self, fw: int, fh: int, pen_color=(20, 24, 32), pen_width: int = 5):
         self.fw = fw
@@ -132,15 +129,13 @@ class InkEngine:
         self.pen_color = pen_color
         self.pen_width = pen_width
         
-        # One-Euro filter for position
         self._filter = OneEuroFilter2D(**self.NORMAL_PRESET)
         
-        # State
         self._pen_down = False
         self._prev_pt: Optional[Tuple[int, int]] = None
-        self._prev_prev_pt: Optional[Tuple[int, int]] = None  # for Bézier midpoint
-        self._dead_zone_px = 2.0   # pixels of movement below which we consider "still"
-        self._teleport_threshold = 0.12  # normalized units — jump bigger than this = new stroke
+        self._prev_prev_pt: Optional[Tuple[int, int]] = None
+        self._dead_zone_px = 1.0
+        self._teleport_threshold = 0.18
         self._last_raw = (0.5, 0.5)
         self._initialized = False
 

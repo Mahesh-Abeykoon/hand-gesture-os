@@ -191,20 +191,16 @@ class OvButton:
         x1, y1 = self.x, self.y
         x2, y2 = self.x + self.w, self.y + self.h
 
-        # Glass-style dark background
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), (15, 20, 35), -1)
-        cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+        bg_color = (25, 30, 45) if active else (15, 20, 30)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), bg_color, -1)
 
-        # Border — bright if active
-        border = (80, 200, 100) if active else (60, 80, 110)
+        border = (80, 200, 100) if active else (50, 65, 90)
         cv2.rectangle(frame, (x1, y1), (x2, y2), border, 2, cv2.LINE_AA)
 
-        # Label
-        txt_color = (80, 220, 110) if active else (200, 210, 230)
+        txt_color = (80, 220, 110) if active else (190, 200, 220)
         cv2.putText(frame, self.label,
                     (x1 + 12, y1 + int(self.h * 0.65)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.62, txt_color, 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, txt_color, 1, cv2.LINE_AA)
 
 
 def make_buttons(frame_w: int, frame_h: int) -> list[OvButton]:
@@ -321,24 +317,21 @@ class Worker(QObject):
         self.ink.clear()
 
     def _hud(self, frame: np.ndarray, tip_px: Optional[Tuple[int, int]], drawing: bool) -> None:
-        """Draw buttons + fingertip cursor + status bar ON the frame (in place)."""
+        """Minimal professional HUD."""
         fh, fw = frame.shape[:2]
 
-        # Buttons
         for btn in self.buttons:
             btn.draw(frame, btn.action == self.tool)
 
-        # Fingertip cursor dot
         if tip_px is not None:
             col = (60, 230, 100) if drawing else (180, 180, 180)
-            cv2.circle(frame, tip_px, 10, col,         -1, cv2.LINE_AA)
-            cv2.circle(frame, tip_px, 10, (255,255,255), 1, cv2.LINE_AA)
+            cv2.circle(frame, tip_px, 8, col, -1, cv2.LINE_AA)
+            cv2.circle(frame, tip_px, 8, (255, 255, 255), 1, cv2.LINE_AA)
 
-        # Bottom status strip
-        status = f"  {'DRAWING' if drawing else 'HOVER'}  |  {self.tool}  |  {self._fps:.0f} fps   [ raise index finger only to draw ]"
-        cv2.rectangle(frame, (0, fh - 36), (fw, fh), (8, 10, 18), -1)
-        cv2.putText(frame, status, (10, fh - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (180, 200, 230), 1, cv2.LINE_AA)
+        label = f"{'DRAWING' if drawing else 'HOVER'}  {self._fps:.0f} FPS"
+        cv2.rectangle(frame, (0, fh - 32), (fw, fh), (8, 10, 18), -1)
+        cv2.putText(frame, label, (12, fh - 9),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.45, (180, 200, 230), 1, cv2.LINE_AA)
 
     @pyqtSlot()
     def run(self) -> None:

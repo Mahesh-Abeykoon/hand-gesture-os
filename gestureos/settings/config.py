@@ -27,6 +27,7 @@ class AppConfig:
     sound_feedback: bool = True
     dark_mode: bool = True
     show_skeleton: bool = True
+    desktop_hud_enabled: bool = True
     multi_monitor: bool = True
     cooldowns: Dict[str, float] = field(default_factory=dict)
     gesture_toggles: Dict[str, bool] = field(default_factory=dict)

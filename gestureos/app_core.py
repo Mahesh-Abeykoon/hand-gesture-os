@@ -4,7 +4,6 @@ from typing import Callable, List, Optional, Tuple
 
 import cv2
 import numpy as np
-import math
 
 from gestureos.actions.controller import ActionController
 from gestureos.gestures.recognizer import GestureRecognizer
@@ -535,106 +534,45 @@ class GestureEngine:
     def _draw_hud(self, frame, event: GestureEvent, fps: float, hand_seen: bool):
         h, w = frame.shape[:2]
         active = self.config.gesture_mode_active or not self.config.activation_required
-        bracket_color = (255, 200, 80) if active else (130, 110, 95)  # Neon Cyan-Blue in BGR
-        
-        # 1. Sleek tactical corner brackets on the camera viewport edges
-        bracket_len = 24
-        bracket_thick = 2
-        # Top Left
-        cv2.line(frame, (8, 8), (8 + bracket_len, 8), bracket_color, bracket_thick)
-        cv2.line(frame, (8, 8), (8, 8 + bracket_len), bracket_color, bracket_thick)
-        # Top Right
-        cv2.line(frame, (w - 8, 8), (w - 8 - bracket_len, 8), bracket_color, bracket_thick)
-        cv2.line(frame, (w - 8, 8), (w - 8, 8 + bracket_len), bracket_color, bracket_thick)
-        # Bottom Left
-        cv2.line(frame, (8, h - 8), (8 + bracket_len, h - 8), bracket_color, bracket_thick)
-        cv2.line(frame, (8, h - 8), (8, h - 8 - bracket_len), bracket_color, bracket_thick)
-        # Bottom Right
-        cv2.line(frame, (w - 8, h - 8), (w - 8 - bracket_len, h - 8), bracket_color, bracket_thick)
-        cv2.line(frame, (w - 8, h - 8), (w - 8, h - 8 - bracket_len), bracket_color, bracket_thick)
 
-        # 2. Glowing target locking crosshair at the fingertip
+        # ── Top-left status pill ──
+        status_color = (30, 180, 80) if active else (80, 80, 90)
+        status_text = "LIVE" if active else "STANDBY"
+        label = f"{status_text}  {fps:.0f} FPS"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.5, 2)
+        pad_x, pad_y = 16, 10
+        px, py = 14, 14
+        pw, ph = tw + pad_x * 2, th + pad_y * 2
+        cv2.rectangle(frame, (px, py), (px + pw, py + ph), (10, 12, 20), -1)
+        cv2.rectangle(frame, (px, py), (px + pw, py + ph), status_color, 1)
+        cv2.putText(frame, label, (px + pad_x, py + pad_y + th - 2),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.5, (220, 225, 235), 2, cv2.LINE_AA)
+
+        # ── Center-bottom gesture name ──
+        gesture_name = event.gesture.value.replace("_", " ").upper()
+        if gesture_name != "NONE":
+            (gw, gh), _ = cv2.getTextSize(gesture_name, cv2.FONT_HERSHEY_DUPLEX, 0.85, 3)
+            gx = (w - gw) // 2
+            gy = h - 28
+            cv2.putText(frame, gesture_name, (gx, gy),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.85, (220, 225, 235), 3, cv2.LINE_AA)
+
+        # ── Fingertip dot ──
         if hand_seen and self.last_hands:
-            hand = self.last_hands[0]
-            lm = hand.landmarks
+            lm = self.last_hands[0].landmarks
             px = int(lm[8][0] * w)
             py = int(lm[8][1] * h)
-            
-            # Glow circle
-            cv2.circle(frame, (px, py), 12, (255, 230, 100), 1, cv2.LINE_AA)
-            # Target center point
-            cv2.circle(frame, (px, py), 2, (0, 165, 255), -1, cv2.LINE_AA)  # Orange reticle point
-            
-            # Crosshair segments
-            cv2.line(frame, (px - 18, py), (px - 8, py), (255, 230, 100), 1)
-            cv2.line(frame, (px + 8, py), (px + 18, py), (255, 230, 100), 1)
-            cv2.line(frame, (px, py - 18), (px, py - 8), (255, 230, 100), 1)
-            cv2.line(frame, (px, py + 8), (px, py + 18), (255, 230, 100), 1)
-            
-            # Glowing label
-            cv2.putText(frame, "TARGET LOCK", (px + 14, py - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 165, 255), 1, cv2.LINE_AA)
+            cv2.circle(frame, (px, py), 5, (255, 255, 255), -1, cv2.LINE_AA)
+            cv2.circle(frame, (px, py), 8, (255, 255, 255), 1, cv2.LINE_AA)
 
-        # 3. Sophisticated glassmorphism status telemetry block
-        hud_x, hud_y, hud_w, hud_h = 16, 16, 440, 110
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (hud_x, hud_y), (hud_x + hud_w, hud_y + hud_h), (12, 16, 28), -1)
-        cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
-        
-        # Left neon vertical accent bar
-        cv2.rectangle(frame, (hud_x, hud_y), (hud_x + 6, hud_y + hud_h), bracket_color, -1)
-        # Grid border
-        cv2.rectangle(frame, (hud_x, hud_y), (hud_x + hud_w, hud_y + hud_h), (45, 60, 95), 1, cv2.LINE_AA)
-        
-        # Telemetry Content
-        dot_color = (80, 245, 120) if active else (100, 110, 130)
-        cv2.circle(frame, (hud_x + 24, hud_y + 24), 5, dot_color, -1, cv2.LINE_AA)
-        cv2.putText(frame, "GESTURE OS // TELEMETRY v2.5", (hud_x + 36, hud_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 200, 240), 1, cv2.LINE_AA)
-        
-        # State title
-        status_str = "ACTIVE CONTROL" if active else "SYSTEM STANDBY"
-        status_color = (255, 230, 100) if active else (150, 160, 175)
-        cv2.putText(frame, status_str, (hud_x + 20, hud_y + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.65, status_color, 2, cv2.LINE_AA)
-        
-        # Detailed stats row
-        warning_str = getattr(self, "lighting_warning_short", "")
-        if warning_str and not hand_seen:
-            hand_status = f"POOR LIGHT ({warning_str})"
-            hand_color = (60, 100, 255)  # Amber warning color
-        else:
-            hand_status = "LOCKED" if hand_seen else "SEARCHING..."
-            hand_color = (80, 245, 120) if hand_seen else (80, 150, 255)
-        cv2.putText(frame, f"TRACKING: {hand_status}", (hud_x + 20, hud_y + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.42, hand_color, 1, cv2.LINE_AA)
-        cv2.putText(frame, f"GESTURE: {event.gesture.value.upper()}", (hud_x + 190, hud_y + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (240, 240, 245), 1, cv2.LINE_AA)
-        cv2.putText(frame, f"CONF: {event.confidence:.2f}", (hud_x + 335, hud_y + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 200, 240), 1, cv2.LINE_AA)
-        
-        # Sleek upper-right FPS module
-        cv2.rectangle(frame, (hud_x + hud_w - 75, hud_y + 12), (hud_x + hud_w - 12, hud_y + 36), (20, 28, 48), -1)
-        cv2.rectangle(frame, (hud_x + hud_w - 75, hud_y + 12), (hud_x + hud_w - 12, hud_y + 36), (45, 60, 95), 1, cv2.LINE_AA)
-        cv2.putText(frame, f"{fps:.1f} FPS", (hud_x + hud_w - 68, hud_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 220, 255), 1, cv2.LINE_AA)
-
-
-        
-        # 5. Glowing alert card for bad lighting conditions
+        # ── Lighting warning (simple text, no pulsing card) ──
         if not hand_seen and getattr(self, "lighting_warning", None):
-            card_x, card_y, card_w, card_h = w - 300, h - 136, 284, 120
-            card_overlay = frame.copy()
-            cv2.rectangle(card_overlay, (card_x, card_y), (card_x + card_w, card_y + card_h), (12, 18, 32), -1)
-            cv2.addWeighted(card_overlay, 0.8, frame, 0.2, 0, frame)
-            
-            pulse = int(140 + 80 * math.sin(time.perf_counter() * 5))
-            cv2.rectangle(frame, (card_x, card_y), (card_x + card_w, card_y + card_h), (0, pulse, pulse + 20), 1, cv2.LINE_AA)
-            cv2.rectangle(frame, (card_x, card_y), (card_x + 8, card_y + card_h), (0, pulse - 30, pulse + 10), -1)
-            
-            cv2.putText(frame, "LIGHTING ALERT", (card_x + 18, card_y + 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, pulse, pulse + 20), 2, cv2.LINE_AA)
-            
-            lines = [
-                "Camera feed is too dark or",
-                "backlit. Please:",
-                "1. Turn on a desk lamp/light",
-                "2. Reposition webcam from window"
-            ]
-            for idx, line in enumerate(lines):
-                cv2.putText(frame, line, (card_x + 18, card_y + 46 + idx * 16),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 200, 240), 1, cv2.LINE_AA)
+            short = getattr(self, "lighting_warning_short", "")
+            warn = f"Low light: {short}"
+            (ww, wh), _ = cv2.getTextSize(warn, cv2.FONT_HERSHEY_SIMLEX, 0.5, 1)
+            wx = (w - ww) // 2
+            wy = 52
+            cv2.putText(frame, warn, (wx, wy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 180, 255), 1, cv2.LINE_AA)
+
         return frame

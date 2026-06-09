@@ -49,6 +49,7 @@ from gestureos.settings.config import AppConfig
 from gestureos.utils.logging import get_logger
 from gestureos.ui.ocr_engine import AdvancedOCREngine
 from gestureos.drawing.ink_engine import InkEngine
+from gestureos.ui.overlay import GlobalHUDOverlay
 
 
 STYLE = """
@@ -240,9 +241,9 @@ class WhiteboardCanvas(QWidget):
         target_x = max(0, min(self.canvas.width() - 1, x_norm * self.canvas.width()))
         target_y = max(0, min(self.canvas.height() - 1, y_norm * self.canvas.height()))
 
-        # Reject genuine teleports only (detector landmark swap across the frame).
         jump = ((target_x - self.cursor_x) ** 2 + (target_y - self.cursor_y) ** 2) ** 0.5
-        if jump > max(self.canvas.width(), self.canvas.height()) * 0.20:
+        max_dim = max(self.canvas.width(), self.canvas.height())
+        if jump > max_dim * 0.25:
             self.stroke_points.clear()
             self.last_draw = False
             self.cursor_x = self.smooth_x = target_x
@@ -250,14 +251,11 @@ class WhiteboardCanvas(QWidget):
             self.update()
             return
 
-        # EMA smoothing — high alpha so the pen follows the finger closely.
-        alpha = 0.55
+        alpha = 0.60
         nx = self.smooth_x + alpha * (target_x - self.smooth_x)
         ny = self.smooth_y + alpha * (target_y - self.smooth_y)
 
-        # Only clamp genuinely huge steps (80 px) to prevent one bad frame
-        # leaving a long scar.  Normal fast writing should NOT be clamped.
-        max_step = 80.0
+        max_step = 120.0
         step = ((nx - self.cursor_x) ** 2 + (ny - self.cursor_y) ** 2) ** 0.5
         if step > max_step:
             scale = max_step / max(step, 1e-6)
@@ -489,14 +487,11 @@ class FullScreenDrawWindow(QMainWindow):
             self._ink_w, self._ink_h = fw, fh
             self._prev_pt = None
 
-        # Blend: only paint where ink pixel is NOT white
-        mask = np.any(self._ink < 245, axis=2)
-        out = frame_bgr.copy()
-        if mask.any():
-            out[mask] = (
-                frame_bgr[mask].astype(np.float32) * 0.15
-                + self._ink[mask].astype(np.float32) * 0.85
-            ).astype(np.uint8)
+        # Blend: smooth alpha compositing
+        ink_gray = cv2.cvtColor(self._ink, cv2.COLOR_BGR2GRAY)
+        alpha = np.clip(1.0 - ink_gray.astype(np.float32) / 255.0, 0.0, 1.0)
+        alpha = np.stack([alpha] * 3, axis=2)
+        out = (frame_bgr.astype(np.float32) * (1.0 - alpha) + self._ink.astype(np.float32) * alpha).astype(np.uint8)
 
         out_rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
         h, w, ch = out_rgb.shape
@@ -515,14 +510,12 @@ class FullScreenDrawWindow(QMainWindow):
             self._prev_drawing = False
             return
 
-        # EMA smoothing
-        alpha = 0.55
+        alpha = 0.60
         if not self._sinit:
             self._sx, self._sy, self._sinit = cx, cy, True
         else:
-            if ((cx - self._sx) ** 2 + (cy - self._sy) ** 2) ** 0.5 < 0.20:
-                self._sx += alpha * (cx - self._sx)
-                self._sy += alpha * (cy - self._sy)
+            self._sx += alpha * (cx - self._sx)
+            self._sy += alpha * (cy - self._sy)
 
         px = int(max(0, min(self._ink_w - 1, self._sx * self._ink_w)))
         py = int(max(0, min(self._ink_h - 1, self._sy * self._ink_h)))
@@ -561,6 +554,7 @@ class FullScreenDrawWindow(QMainWindow):
 
 class EngineWorker(QObject):
     frameReady = pyqtSignal(QImage, str, float, float, bool, bool, float, float, float, float, bool)
+    actionReady = pyqtSignal(str, dict)
     logReady = pyqtSignal(str)
     errorReady = pyqtSignal(str)
     startedReady = pyqtSignal()
@@ -576,6 +570,7 @@ class EngineWorker(QObject):
     def start(self):
         try:
             self.engine = GestureEngine(self.config, self.logReady.emit)
+            self.engine.actions.on_action = lambda ev_type, data: self.actionReady.emit(ev_type, data)
             self.running = True
             self.startedReady.emit()
             while self.running:
@@ -741,6 +736,9 @@ class GestureOSQtApp(QMainWindow):
         self._draw_mode = False
         self._draw_false_frames = 0
         self.recognizer = WhiteboardRecognizer()
+        self.overlay = GlobalHUDOverlay()
+        if self.config_data.desktop_hud_enabled:
+            self.overlay.show()
         self._build_ui()
         self._start_worker()
         self._setup_shortcuts()
@@ -917,7 +915,9 @@ class GestureOSQtApp(QMainWindow):
         self.sound.setChecked(self.config_data.sound_feedback)
         self.low_light = QCheckBox("Low-light enhancement")
         self.low_light.setChecked(self.config_data.low_light_enhancement)
-        for w in [self.activation_required, self.skeleton, self.sound, self.low_light]:
+        self.desktop_hud = QCheckBox("Enable Global Desktop HUD Overlay")
+        self.desktop_hud.setChecked(self.config_data.desktop_hud_enabled)
+        for w in [self.activation_required, self.skeleton, self.sound, self.low_light, self.desktop_hud]:
             w.stateChanged.connect(self._save_controls)
             f.addWidget(w)
         layout.addWidget(safety)
@@ -1093,6 +1093,7 @@ class GestureOSQtApp(QMainWindow):
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.start)
         self.worker.frameReady.connect(self._on_frame)
+        self.worker.actionReady.connect(self._on_action)
         self.worker.logReady.connect(self._log)
         self.worker.errorReady.connect(self._error)
         self.worker.startedReady.connect(lambda: self._log("Engine started"))
@@ -1103,6 +1104,14 @@ class GestureOSQtApp(QMainWindow):
         self.pauseRequested.connect(self.worker.set_paused)
         self.stopRequested.connect(self.worker.stop)
         self.thread.start()
+
+    def _on_action(self, event_type: str, data: dict):
+        if not self.config_data.desktop_hud_enabled or not self.overlay:
+            return
+        if event_type == "click":
+            self.overlay.trigger_click_ripple(data.get("button", "left"))
+        elif event_type == "volume":
+            self.overlay.set_volume(data.get("value", 50))
 
     def _toggle_draw_mode(self, checked: bool):
         """Toggle draw mode on/off from the header button."""
@@ -1332,15 +1341,13 @@ class GestureOSQtApp(QMainWindow):
                     int(max(0, min(fh - 1, fy * fh)))
                 )
 
-        # ── Blend ink onto camera frame ────────────────────────────────
+        # ── Blend ink onto camera frame (smooth alpha compositing) ────
         out = frame_bgr.copy()
         if self._draw_mode and self._ink is not None:
-            mask = np.any(self._ink < 245, axis=2)
-            if mask.any():
-                out[mask] = (
-                    frame_bgr[mask].astype(np.float32) * 0.08
-                    + self._ink[mask].astype(np.float32) * 0.92
-                ).astype(np.uint8)
+            ink_gray = cv2.cvtColor(self._ink, cv2.COLOR_BGR2GRAY)
+            alpha = np.clip(1.0 - ink_gray.astype(np.float32) / 255.0, 0.0, 1.0)
+            alpha = np.stack([alpha] * 3, axis=2)
+            out = (frame_bgr * (1.0 - alpha) + self._ink * alpha).astype(np.uint8)
 
         # ── Draw cursor dot on the blended frame ──────────────────────
         if show_cursor and cursor_pt is not None and self._ink_engine is not None:
@@ -1353,7 +1360,8 @@ class GestureOSQtApp(QMainWindow):
         display_img = QImage(out_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
 
         # ── Display on main camera label ───────────────────────────────
-        pix = QPixmap.fromImage(display_img).scaled(
+        self._display_pix = QPixmap.fromImage(display_img)
+        pix = self._display_pix.scaled(
             self.video.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
@@ -1420,6 +1428,13 @@ class GestureOSQtApp(QMainWindow):
         self.config_data.show_skeleton = self.skeleton.isChecked()
         self.config_data.sound_feedback = self.sound.isChecked()
         self.config_data.low_light_enhancement = self.low_light.isChecked()
+        hud_enabled = self.desktop_hud.isChecked()
+        self.config_data.desktop_hud_enabled = hud_enabled
+        if self.overlay:
+            if hud_enabled:
+                self.overlay.show()
+            else:
+                self.overlay.hide()
         self._save_all()
 
     def _slider_changed(self):
@@ -1482,6 +1497,8 @@ class GestureOSQtApp(QMainWindow):
             if self.thread:
                 self.thread.quit()
                 self.thread.wait(2500)
+            if self.overlay:
+                self.overlay.close()
         finally:
             super().closeEvent(event)
 
